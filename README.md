@@ -1,3 +1,7 @@
+DISCLAIMER: This Repository is FULLY AI generated
+
+
+
 # PropSim: propeller simulator and generator
 
 PropSim estimates a propeller's **thrust, torque and power straight from its 3D model** (STL or STEP), and **designs new propellers** for your motor, battery and flight condition, ready to 3D print.
