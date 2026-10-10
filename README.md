@@ -86,7 +86,3 @@ The round trip checks that the generated geometry is the one that was designed. 
 - **Microsoft MPI** 10.1.1 runtime (`msmpi.dll`, `mpiexec.exe`, `smpd.exe`) is included for parallel CFD runs, under the MIT licence (`cfd-engine/licenses/MS-MPI-LICENSE.txt`).
 - **gmsh** (GPL v2 or later) reads and writes STEP files. It is optional for the command line and bundled inside `PropSim.exe`.
 - Other Python libraries: numpy, scipy, trimesh, manifold3d and customtkinter. PyInstaller builds the exe.
-
-## License
-
-PropSim's own source code: **license not chosen yet**. Add a `LICENSE` file, for example MIT or GPL-3.0, and state it here. The third-party components above keep their own licences. The Windows release includes GPL-licensed binaries (OpenFOAM, and gmsh inside the exe), so the release must make their source available. `cfd-engine/NOTICE.txt` does this for OpenFOAM. Because PropSim.exe bundles gmsh, a GPL-compatible license for PropSim's own code (for example GPL-3.0) is the simplest choice if you publish the exe.
