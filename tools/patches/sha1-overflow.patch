@@ -1,0 +1,21 @@
+--- a/src/OpenFOAM/db/IOstreams/hashes/OSHA1stream.H	2026-10-07 22:27:15.255268283 +0000
++++ b/src/OpenFOAM/db/IOstreams/hashes/OSHA1stream.H	2026-10-07 22:27:15.274140243 +0000
+@@ -70,6 +70,18 @@
+             return n;
+         }
+ 
++        //- Put a single character (the unbuffered streambuf sends every
++        //- single-character put here; the default fails the stream)
++        virtual int overflow(int c = EOF)
++        {
++            if (c != EOF)
++            {
++                const char ch = static_cast<char>(c);
++                sha1_.append(&ch, 1);
++            }
++            return c == EOF ? 0 : c;
++        }
++
+     public:
+ 
+         //- Construct null

@@ -1,0 +1,60 @@
+The files in this directory are the neural-network weights of NeuralFoil 0.3.3
+(https://github.com/peterdsharpe/NeuralFoil), by Peter Sharpe, used by sectionfoil.py.
+Changes: only the first four network outputs (analysis confidence, CL, CD, CM) are used, so the
+output layer of each network is truncated to those rows; the arrays are otherwise copied unchanged
+(float32). The network inference in sectionfoil.py is a NumPy re-implementation of NeuralFoil's
+get_aero_from_kulfan_parameters(), and its Kulfan (CST) airfoil fit re-implements the method of
+AeroSandbox's get_kulfan_parameters() / Airfoil.normalize() (https://github.com/peterdsharpe/AeroSandbox).
+Both projects are distributed under the MIT License, reproduced below.
+
+-------------------------------------------------------------------------------
+NeuralFoil
+-------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2023-2023 Peter Sharpe
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+AeroSandbox (Kulfan/CST fitting method)
+-------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2019-2023 Peter Sharpe
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

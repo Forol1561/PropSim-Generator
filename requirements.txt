@@ -1,0 +1,10 @@
+numpy
+scipy
+trimesh
+manifold3d     # mesh booleans: generated props as one solid (counterweight, rod hole)
+# optional, for reading STEP files directly:
+# gmsh
+# for the desktop app (propsim_gui.py):
+# customtkinter
+# to build PropSim.exe:
+# pyinstaller
