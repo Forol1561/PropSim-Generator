@@ -103,7 +103,7 @@ def _step_to_stl(path: str) -> str:
     import hashlib
 
     st = os.stat(path)
-    key = hashlib.sha1(f"v3|{os.path.abspath(path)}|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()[:16]
+    key = hashlib.sha1(f"v4|{os.path.abspath(path)}|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()[:16]
     out = os.path.join(tempfile.gettempdir(), f"propsim_step_{key}.stl")
     if os.path.exists(out) and os.path.getsize(out) > 0:
         return out
@@ -139,6 +139,9 @@ def _step_to_stl(path: str) -> str:
             # curvature refinement and need it for a faithful thickness distribution
             gmsh.option.setNumber("Mesh.MeshSizeMax", size / 250)
             gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 12)
+            # ... and a floor: curvature sizing near thin, sharp trailing edges otherwise refines without
+            # end (a million nodes and GBs for one B-spline blade face)
+            gmsh.option.setNumber("Mesh.MeshSizeMin", size / 1500)
             gmsh.option.setNumber("Mesh.Algorithm", 6)
             gmsh.model.mesh.generate(2)
             gmsh.write(out)
@@ -267,7 +270,8 @@ def _split_surfaces(x: np.ndarray, y: np.ndarray, grid: np.ndarray):
 
 
 def _section_properties(s: np.ndarray, z: np.ndarray, ordered: bool = False):
-    """chord, beta, t/c, camber/c of one unrolled section (ordered = points form a closed outline)."""
+    """chord, beta, t/c, camber/c, mid-chord s and chord extent along s (chord * ex_s) of one unrolled
+    section (ordered = points form a closed outline)."""
     pts = np.column_stack([s, z])
     if len(pts) < 6:
         return None
@@ -282,6 +286,7 @@ def _section_properties(s: np.ndarray, z: np.ndarray, ordered: bool = False):
     rel = pts - origin
     x = rel @ ex / chord
     y = rel @ ey / chord
+    s_mid, s_ext = float(origin[0] + 0.5 * chord * ex[0]), float(chord * ex[0])
     grid = np.linspace(0.05, 0.95, 37)
     if ordered:
         # split the closed outline at leading and trailing edge into the two surfaces
@@ -295,11 +300,11 @@ def _section_properties(s: np.ndarray, z: np.ndarray, ordered: bool = False):
                 upper.append(y[m].max())
                 lower.append(y[m].min())
         if len(upper) < 4:
-            return chord, beta, np.nan, np.nan
+            return chord, beta, np.nan, np.nan, s_mid, s_ext
         upper, lower = np.array(upper), np.array(lower)
     thick = float((upper - lower).max())
     camber = float(np.abs(0.5 * (upper + lower)).max())
-    return chord, beta, thick, camber
+    return chord, beta, thick, camber, s_mid, s_ext
 
 
 def _section_outline(s: np.ndarray, z: np.ndarray):
@@ -457,7 +462,7 @@ def extract_geometry(
     # Cosine spacing: more stations near the root and tip where things change fastest
     u = np.linspace(0, 1, stations)
     rr = hub_ratio * R + (0.985 * R - hub_ratio * R) * 0.5 * (1 - np.cos(u * np.pi))
-    out = {k: [] for k in ("r", "c", "b", "t", "k")}
+    out = {k: [] for k in ("r", "c", "b", "t", "k", "th", "dth")}
     outlines, all_outlines = [], []      # per accepted station: one blade's traced outline (or None)
     for r in rr:
         pts, chains = slicer.cut(r)
@@ -490,6 +495,8 @@ def extract_geometry(
             s = r * np.angle(np.exp(1j * (thg - ref)))
             p = _section_properties(s, pts[idx, 2], ordered)
             if p is not None:
+                # angular position of the mid-chord point and the chord's angular extent (for sweep)
+                p = (*p[:4], ref + p[4] / r, p[5] / r)
                 props.append(p)
                 o = _section_outline(s, pts[idx, 2]) if ordered else None
                 if o is not None:
@@ -505,6 +512,9 @@ def extract_geometry(
         out["b"].append(np.nanmean(props[:, 1]))
         out["t"].append(np.nanmean(props[:, 2]) if np.isfinite(props[:, 2]).any() else np.nan)
         out["k"].append(np.nanmean(props[:, 3]) if np.isfinite(props[:, 3]).any() else np.nan)
+        # blades folded onto one (angles times the blade count), so any blade gives the same position
+        out["th"].append(np.angle(np.mean(np.exp(1j * blades * props[:, 4]))) / blades)
+        out["dth"].append(float(np.mean(props[:, 5])))
 
     if len(out["r"]) < 5:
         raise ValueError("Too few valid blade sections; try a finer mesh or set --blades / --hub-ratio.")
@@ -515,7 +525,12 @@ def extract_geometry(
     t = np.where(np.isfinite(t), t, 0.10)
     k = np.where(np.isfinite(k), k, 0.03)
     sections, spin_sign, thrust_sign = _orient_sections(outlines, all_outlines, notes)
-    return BladeGeometry(
+    sweep = _measure_sweep(np.array(out["r"]), np.array(out["th"]), np.array(out["dth"]), blades, spin_sign, R)
+    if sweep is not None:
+        notes.append(f"swept blade: the quarter-chord line is swept up to {np.degrees(np.abs(sweep)).max():.0f} deg "
+                     f"({'back' if sweep[np.argmax(np.abs(sweep))] > 0 else 'forward'}); the sections use simple "
+                     "sweep theory")
+    g = BladeGeometry(
         r=np.array(out["r"]),
         chord=np.array(out["c"]),
         beta=np.array(out["b"]),
@@ -530,6 +545,51 @@ def extract_geometry(
         spin_sign=spin_sign,
         thrust_sign=thrust_sign,
     )
+    if sweep is not None:
+        g.sweep = sweep
+    return g
+
+
+SWEEP_MIN_DEG = 6.0      # a blade whose straightest chordwise line stays within this of radial is unswept
+
+
+def _measure_sweep(r, th, dth, blades, spin_sign, R):
+    """Local sweep angle per station (backwards positive) of the blade's stacking line, from the sections'
+    angular positions; None when the blade is essentially unswept.
+
+    Taper alone tilts the leading and trailing edges (and the quarter-chord line) opposite ways, so the
+    test for sweep uses the chordwise line (15 to 60 % chord) that is straightest on the inner blade,
+    where blades are normally unswept: the line the sections are stacked on. A scimitar blade shows its
+    sweep growing outboard along that line, an unswept one shows none. The sweep returned for a swept
+    blade is that of the quarter-chord line, the usual aerodynamic reference."""
+    if len(r) < 6:
+        return None
+    sgn = spin_sign if spin_sign else 1
+    th = np.unwrap(th * blades) / blades
+    ext = np.abs(dth)
+    # local linear fit (Gaussian weights, 5 % of the radius): its slope is d theta / d r
+    sig = 0.05 * R
+    w = np.exp(-0.5 * ((r[:, None] - r[None, :]) / sig) ** 2)
+    sw, sx, sxx = w.sum(1), w @ r, w @ (r * r)
+    den = sw * sxx - sx * sx
+
+    def sweep_of(y):
+        sy, sxy = w @ y, w @ (r * y)
+        slope = np.where(np.abs(den) > 1e-30, (sw * sxy - sx * sy) / np.where(den == 0, 1, den), 0.0)
+        return np.arctan(-sgn * r * slope)
+    body = (r > 0.3 * R) & (r < 0.95 * R)
+    if not body.any():
+        return None
+    # the leading edge is on the side the blade travels to (+s for positive spin); x = chord fraction
+    lines = [sweep_of(th + sgn * (0.5 - x) * ext) for x in np.linspace(0.15, 0.6, 19)]
+    inner = (r > 0.25 * R) & (r < 0.5 * R)
+    if not inner.any():
+        inner = body
+    best = min(lines, key=lambda lam: float(np.abs(lam[inner]).max()))
+    if np.degrees(np.abs(best[body]).max()) < SWEEP_MIN_DEG:
+        return None
+    # swept: the aerodynamic sweep is that of the quarter-chord line
+    return np.clip(sweep_of(th + sgn * 0.25 * ext), -np.radians(60), np.radians(70))
 
 
 def _orient_sections(outlines, all_outlines, notes):
@@ -604,20 +664,40 @@ def _plane_loops(v, faces, z):
 
 
 def _bore_center(v, faces, R):
-    """Centre (x, y) of a round shaft bore: the smallest closed, circular section loop near the
-    middle of the model's height whose radius is under 0.2 R. None if there is none."""
-    best = None
+    """Centre (x, y) of a round shaft bore: a closed, circular section loop near the middle of the
+    model's height whose radius is under 0.2 R. Mounting holes are round too: a loop at the centre of a
+    ring of equal holes is the bore; otherwise the circular loop nearest the current centre (v is
+    centred on the surface centroid) is taken. None if there is none."""
     for q in (0.5, 0.4, 0.6):
         z = float(np.quantile(v[:, 2], q))
+        cand = []
         for lp in _plane_loops(v, np.asarray(faces), z):
             seg = np.linalg.norm(np.diff(lp, axis=0), axis=1)
             mid = 0.5 * (lp[1:] + lp[:-1])
             c = (mid * seg[:, None]).sum(axis=0) / seg.sum()
             rad = np.linalg.norm(lp - c, axis=1)
-            if rad.mean() < 0.2 * R and rad.std() < 0.03 * rad.mean() and (best is None or rad.mean() < best[1]):
-                best = (c, rad.mean())
-        if best is not None:
-            return best[0]
+            if rad.mean() < 0.2 * R and rad.std() < 0.03 * rad.mean():
+                cand.append((c, rad.mean()))
+        if not cand:
+            continue
+        for i, (c, r) in enumerate(cand):
+            # equal holes around this loop, centred on it
+            others = [cj for j, (cj, rj) in enumerate(cand) if j != i]
+            radii = [rj for j, (cj, rj) in enumerate(cand) if j != i]
+            if len(others) >= 2 and np.ptp(radii) < 0.05 * np.mean(radii) and \
+                    np.linalg.norm(np.mean(others, axis=0) - c) < 0.02 * R:
+                return c
+        # a ring of equal, evenly spread holes (the bore itself not round at this height: a D-flat, or a
+        # set screw hole breaking into it): the axis is the ring's centre
+        if len(cand) >= 2:
+            for i, (c, r) in enumerate(cand):
+                ring = [cj for cj, rj in cand if abs(rj - r) < 0.05 * r]
+                if len(ring) >= 2:
+                    m = np.mean(ring, axis=0)
+                    dist = [np.linalg.norm(cj - m) for cj in ring]
+                    if min(dist) > 2 * r and np.ptp(dist) < 0.02 * R and np.hypot(*m) < 0.2 * R:
+                        return m
+        return min(cand, key=lambda x: np.hypot(*x[0]))[0]
     return None
 
 

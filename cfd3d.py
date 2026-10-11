@@ -82,6 +82,10 @@ class CaseSettings:
     flavor: str = ""               # "esi" | "foundation"; "" = the detected installation (esi if none)
     version: str = ""              # OpenFOAM version for flavour differences; "" = detected
     reverse_spin: bool = False     # run the prop backwards (checks the rotation sense; thrust collapses)
+    air: str = "auto"              # "auto" | "incompressible" | "compressible": the solver's air model;
+    #                                auto = compressible (rhoSimpleFoam) above COMPRESSIBLE_AUTO_MACH tip Mach
+    bemt: dict | None = None       # the BEMT the case is made from (thrust, torque, power, hub_radius, argv):
+    #                                stored with the case, so a loaded case is compared with its own BEMT
 
 
 @dataclass
@@ -96,6 +100,22 @@ class CFDResult:
     history: list = field(default_factory=list)   # (iteration, thrust, torque) tuples
     log_path: str = ""
     message: str = ""
+    # forces on the part inside the BEMT's analysed span (r < hub_radius: hub, spinner stub, blade roots),
+    # which the BEMT leaves out; None when the case does not know where the analysed span starts
+    hub_thrust: float | None = None
+    hub_torque: float | None = None
+    hub_radius: float = 0.0
+    hub_final_only: bool = False   # the hub forces come from the last written fields only (older cases)
+    tip_mach: float = 0.0          # helical tip Mach number of the case
+    notes: list = field(default_factory=list)   # caveats for comparing with the BEMT
+
+    @property
+    def blade_thrust(self):
+        return self.thrust - (self.hub_thrust or 0.0)
+
+    @property
+    def blade_torque(self):
+        return self.torque - (self.hub_torque or 0.0)
 
 
 # Mesh resolution presets. Cell size at refinement level k is (R / 1.6) / 2^k, R = tip radius.
@@ -115,6 +135,13 @@ BASE_CELL = 1 / 1.6        # far-field cell size / R
 DOMAIN = dict(upstream=3.0, downstream=6.0, lateral=2.75)   # in diameters, from the rotor
 MRF_RADIUS = 1.1           # MRF zone radius / R
 CASE_INFO = "propsim_case.json"
+A_SOUND_CFD = 340.3          # [m/s] speed of sound, as bemt.A_SOUND (sets the ambient temperature)
+GAMMA_AIR = 1.4
+R_AIR = 287.05               # [J/(kg K)]
+MOLWEIGHT_AIR = 28.965       # [g/mol]: R_AIR = 8314.46 / 28.965
+COMPRESSIBLE_AUTO_MACH = 0.5     # air model "auto": compressible solver above this helical tip Mach number
+TRANSONIC_MACH = 1.0             # rhoSimpleFoam's transonic formulation above this tip Mach number
+SPIN_UP_ITERATIONS = 200         # compressible cases ramp the rotation up over this many iterations
 
 
 # --------------------------------------------------------------------------- detection
@@ -650,6 +677,27 @@ def write_case(case_dir, mesh, geom, settings: CaseSettings) -> dict:
 
     solver = "foamRun -solver incompressibleFluid" if flavor == "foundation" and fmaj >= 11 else "simpleFoam"
     features = "surfaceFeatures" if flavor == "foundation" else "surfaceFeatureExtract"
+    tip_mach = math.hypot(abs(omega) * R, settings.airspeed) / A_SOUND_CFD
+    air = (settings.air or "auto").lower()
+    if air not in ("auto", "incompressible", "compressible"):
+        raise ValueError("air must be 'auto', 'incompressible' or 'compressible'")
+    compressible = air == "compressible" or (air == "auto" and tip_mach > COMPRESSIBLE_AUTO_MACH)
+    if compressible and flavor != "esi":
+        notes.append("the compressible air model is set up for openfoam.com (ESI) only; this case uses the "
+                     "incompressible solver")
+        compressible = False
+    if compressible and inst.found and inst.mode == "bundled" and \
+            not os.path.isfile(os.path.join(inst.engine, "bin", "rhoSimpleFoam" + _EXE)):
+        notes.append("this CFD engine has no compressible solver (rhoSimpleFoam); the case uses the incompressible "
+                     "one - unzip the complete, current PropSim package to get it")
+        compressible = False
+    if compressible:
+        solver = "rhoSimpleFoam"
+    elif tip_mach > COMPRESSIBLE_AUTO_MACH:
+        notes.append(f"tip Mach {tip_mach:.2f} with the incompressible solver: the loads come out too low")
+    T_inf = A_SOUND_CFD ** 2 / (GAMMA_AIR * R_AIR)          # the BEMT's speed of sound
+    p_inf = settings.rho * R_AIR * T_inf                     # so the density is the BEMT's
+    mu = nu * settings.rho
 
     os.makedirs(case_dir, exist_ok=True)
     _clean(case_dir)
@@ -678,12 +726,17 @@ def write_case(case_dir, mesh, geom, settings: CaseSettings) -> dict:
     _write(j("system", "decomposeParDict"), _foam("dictionary", "decomposeParDict", (
         f"numberOfSubdomains {n_procs};\n\nmethod hierarchical;\n\ncoeffs\n{{\n    n {_vec(*_split3(n_procs))};\n"
         f"    order xyz;\n}}\n\nhierarchicalCoeffs\n{{\n    n {_vec(*_split3(n_procs))};\n    order xyz;\n}}")))
-    _write(j("system", "fvSchemes"), _foam("dictionary", "fvSchemes", _FVSCHEMES))
-    sol = _FVSOLUTION + (_FVSOLUTION_PIMPLE if flavor == "foundation" else "")
+    _write(j("system", "fvSchemes"), _foam("dictionary", "fvSchemes", _FVSCHEMES_C if compressible else _FVSCHEMES))
+    sol = (_sub(_FVSOLUTION_C, transonic="yes" if tip_mach > TRANSONIC_MACH else "no") if compressible
+           else _FVSOLUTION + (_FVSOLUTION_PIMPLE if flavor == "foundation" else ""))
     _write(j("system", "fvSolution"), _foam("dictionary", "fvSolution", sol))
     app = ("application foamRun;\nsolver      incompressibleFluid;" if solver.startswith("foamRun")
-           else "application simpleFoam;")
-    cdict = _sub(_CONTROLDICT, app=app, end=iterations, wi=_divisor_near(iterations, iterations // 4), rho=settings.rho)
+           else f"application {solver};")
+    rho_fo = (f"rho             rho;        // compressible: the density field and absolute pressure\n"
+              f"        pRef            {_num(p_inf)};") if compressible else (
+        f"rho             rhoInf;     // incompressible: kinematic pressure times rhoInf\n"
+        f"        rhoInf          {_num(settings.rho)};")
+    cdict = _sub(_CONTROLDICT, app=app, end=iterations, wi=_divisor_near(iterations, iterations // 4), rho=rho_fo)
     # Allrun copies controlDict.orig to controlDict at every start: a stopped run leaves stopAt
     # writeNow behind, and a fallback run (below) replaces the whole file
     for name in ("controlDict", "controlDict.orig"):
@@ -696,10 +749,22 @@ def write_case(case_dir, mesh, geom, settings: CaseSettings) -> dict:
     cdict = re.sub(r"(?m)^purgeWrite\s+\d+;", "purgeWrite      0;", cdict)
     _write(j("system", "controlDict.fieldForces"), _foam("dictionary", "controlDict", cdict))
 
-    _write(j("constant", "MRFProperties"), _foam("dictionary", "MRFProperties", _sub(_MRF, omega=omega)))
+    if compressible:
+        # spin up over the first iterations: an impulsive start at a high tip Mach number drives the
+        # temperature negative within a few iterations (MRF omega is a Function1 of the iteration count)
+        n_ramp = max(10, min(SPIN_UP_ITERATIONS, iterations // 4))
+        omega_entry = f"table ((0 {_num(0.1 * omega)}) ({n_ramp} {_num(omega)}))"
+    else:
+        omega_entry = _num(omega)
+    _write(j("constant", "MRFProperties"), _foam("dictionary", "MRFProperties", _sub(_MRF, omega=omega_entry)))
     turb = ("simulationType RAS;\n\nRAS\n{\n    model       kOmegaSST;     // openfoam.org 8+, ESI v2006+\n"
             "    RASModel    kOmegaSST;     // older ESI\n    turbulence  on;\n    printCoeffs on;\n}")
     nu_entry = f"nu [0 2 -1 0 0 0 0] {_num(nu)};"
+    if compressible:
+        _write(j("system", "fvOptions"), _foam("dictionary", "fvOptions", _sub(
+            _FVOPTIONS_C, tmin=_num(0.5 * T_inf), tmax=_num(2.5 * T_inf))))
+        _write(j("constant", "thermophysicalProperties"), _foam("dictionary", "thermophysicalProperties", _sub(
+            _THERMO, mw=_num(MOLWEIGHT_AIR), cp=_num(GAMMA_AIR / (GAMMA_AIR - 1) * R_AIR), mu=_num(mu))))
     if flavor == "esi":
         _write(j("constant", "turbulenceProperties"), _foam("dictionary", "turbulenceProperties", turb))
         _write(j("constant", "transportProperties"), _foam("dictionary", "transportProperties",
@@ -715,11 +780,14 @@ def write_case(case_dir, mesh, geom, settings: CaseSettings) -> dict:
 
     hover = settings.airspeed <= 0
     u_inf = (0.0, 0.0, -ts * settings.airspeed)      # air moves against the thrust direction
-    for name, text in _initial_fields(hover, u_inf, k0, w0, flavor == "foundation" and fmaj >= 11).items():
+    fields = _initial_fields(hover, u_inf, k0, w0, flavor == "foundation" and fmaj >= 11,
+                             comp=dict(p=p_inf, T=T_inf) if compressible else None)
+    for name, text in fields.items():
         _write(j("0.orig", name), text)
 
     summary = (f"{settings.rpm:.0f} rpm ({'+' if model_spin > 0 else '-'} about the model's +{axis} axis), "
-               + ("hover" if hover else f"{settings.airspeed:g} m/s") + f", {settings.resolution} mesh, "
+               + ("hover" if hover else f"{settings.airspeed:g} m/s")
+               + (", compressible" if compressible else "") + f", {settings.resolution} mesh, "
                f"{n_procs} processes, {iterations} iterations")
     # openfoam.org 11+ has no reconstructParMesh (reconstructPar rebuilds the changed mesh itself)
     recon_mesh = 0 if flavor == "foundation" and fmaj >= 11 else 1
@@ -734,6 +802,9 @@ def write_case(case_dir, mesh, geom, settings: CaseSettings) -> dict:
                 rpm=settings.rpm, omega=omega, spin_sign=spin, thrust_sign=ts, model_axis=axis,
                 model_spin_sign=model_spin, airspeed=settings.airspeed, rho=settings.rho, nu=nu, radius=R,
                 blades=geom.blades, z_offset=z_off,
+                hub_radius=float(getattr(geom, "hub_radius", 0.0) or 0.0), bemt=settings.bemt,
+                air="compressible" if compressible else "incompressible", tip_mach=tip_mach,
+                p_inf=p_inf if compressible else 0.0, T_inf=T_inf, mu=mu,
                 domain=dict(x=[-W, W], y=[-W, W], z=[z_lo, z_hi], base_cell=h0), mrf=mrf,
                 regions={k: dict(radius=r, z=[a, b], level=lev) for k, (r, (a, b), lev) in regions.items()},
                 notes=notes)
@@ -834,12 +905,14 @@ def _clean(case_dir):
             os.remove(os.path.join(case_dir, p))
 
 
-def _initial_fields(hover, u_inf, k0, w0, mrf_noslip_bc):
-    """0.orig/{U,p,k,omega,nut}. Hover: every open boundary entrains or lets out air at ambient total
-    pressure. Forward flight: freestream inlet upstream, fixed static pressure downstream, freestream
-    conditions on the sides."""
+def _initial_fields(hover, u_inf, k0, w0, mrf_noslip_bc, comp=None):
+    """0.orig/{U,p,k,omega,nut} (+ T, alphat for the compressible solver, comp = dict(p, T) of the
+    ambient air; p is then the absolute pressure in Pa). Hover: every open boundary entrains or lets
+    out air at ambient total pressure. Forward flight: freestream inlet upstream, fixed static
+    pressure downstream, freestream conditions on the sides."""
     U = _vec(*u_inf)
     k, w = _num(k0), _num(w0)
+    P0 = _num(comp["p"]) if comp else "0"
     # In the MRF zone the wall velocity is set to omega x r (no slip in the rotating frame): by the
     # MRF code on fixedValue patches (ESI, openfoam.org <= 10), by the MRFnoSlip condition (org 11+,
     # which requires it; org 10 does not have it).
@@ -849,7 +922,7 @@ def _initial_fields(hover, u_inf, k0, w0, mrf_noslip_bc):
     if hover:
         open_ = dict(
             U="type pressureInletOutletVelocity;\n        value uniform (0 0 0);",
-            p="type totalPressure;\n        p0 uniform 0;\n        value uniform 0;",
+            p=f"type totalPressure;\n        p0 uniform {P0};\n        value uniform {P0};",
             k=io(k), omega=io(w), nut="type calculated;\n        value uniform 0;")
         bcs = {f: dict(inlet=open_[f], outlet=open_[f], sides=open_[f]) for f in open_}
     else:
@@ -857,8 +930,8 @@ def _initial_fields(hover, u_inf, k0, w0, mrf_noslip_bc):
             U=dict(inlet=f"type fixedValue;\n        value uniform {U};",
                    outlet=f"type inletOutlet;\n        inletValue uniform (0 0 0);\n        value uniform {U};",
                    sides=f"type freestreamVelocity;\n        freestreamValue uniform {U};\n        value uniform {U};"),
-            p=dict(inlet="type zeroGradient;", outlet="type fixedValue;\n        value uniform 0;",
-                   sides="type freestreamPressure;\n        freestreamValue uniform 0;\n        value uniform 0;"),
+            p=dict(inlet="type zeroGradient;", outlet=f"type fixedValue;\n        value uniform {P0};",
+                   sides=f"type freestreamPressure;\n        freestreamValue uniform {P0};\n        value uniform {P0};"),
             k=dict(inlet=f"type fixedValue;\n        value uniform {k};", outlet=io(k), sides=io(k)),
             omega=dict(inlet=f"type fixedValue;\n        value uniform {w};", outlet=io(w), sides=io(w)),
             nut={b: "type calculated;\n        value uniform 0;" for b in ("inlet", "outlet", "sides")})
@@ -867,10 +940,21 @@ def _initial_fields(hover, u_inf, k0, w0, mrf_noslip_bc):
                  omega=f"type omegaWallFunction;\n        value uniform {w};",
                  nut="type nutUSpaldingWallFunction;\n        value uniform 0;")   # any y+ (no layers)
     spec = dict(U=("volVectorField", "[0 1 -1 0 0 0 0]", "(0 0 0)" if hover else U),
-                p=("volScalarField", "[0 2 -2 0 0 0 0]", "0"),
+                p=("volScalarField", "[1 -1 -2 0 0 0 0]" if comp else "[0 2 -2 0 0 0 0]", P0),
                 k=("volScalarField", "[0 2 -2 0 0 0 0]", k),
                 omega=("volScalarField", "[0 0 -1 0 0 0 0]", w),
                 nut=("volScalarField", "[0 2 -1 0 0 0 0]", "0"))
+    if comp:
+        T = _num(comp["T"])
+        for b in ("inlet", "outlet", "sides"):
+            bcs.setdefault("T", {})[b] = io(T)
+            bcs.setdefault("alphat", {})[b] = "type calculated;\n        value uniform 0;"
+        if not hover:
+            bcs["T"]["inlet"] = f"type fixedValue;\n        value uniform {T};"
+        walls["T"] = "type zeroGradient;"
+        walls["alphat"] = "type compressible::alphatWallFunction;\n        Prt 0.85;\n        value uniform 0;"
+        spec["T"] = ("volScalarField", "[0 0 0 1 0 0 0]", T)
+        spec["alphat"] = ("volScalarField", "[1 -1 -1 0 0 0 0]", "0")
     out = {}
     for f, (cls, dims, init) in spec.items():
         body = [f"dimensions      {dims};\n\ninternalField   uniform {init};\n\nboundaryField\n{{",
@@ -1192,6 +1276,145 @@ relaxationFactors
 }
 """
 
+# compressible air (rhoSimpleFoam, ESI): perfect gas, constant viscosity (the BEMT's), internal energy
+_THERMO = """
+thermoType
+{
+    type            hePsiThermo;
+    mixture         pureMixture;
+    transport       const;
+    thermo          hConst;
+    equationOfState perfectGas;
+    specie          specie;
+    energy          sensibleInternalEnergy;
+}
+
+mixture
+{
+    specie
+    {
+        molWeight   @@mw@@;
+    }
+    thermodynamics
+    {
+        Cp          @@cp@@;
+        Hf          0;
+    }
+    transport
+    {
+        mu          @@mu@@;
+        Pr          0.71;
+    }
+}
+"""
+
+_FVSCHEMES_C = """
+ddtSchemes
+{
+    default         steadyState;
+}
+
+gradSchemes
+{
+    default         Gauss linear;
+    grad(U)         cellLimited Gauss linear 1;
+    grad(k)         cellLimited Gauss linear 1;
+    grad(omega)     cellLimited Gauss linear 1;
+}
+
+divSchemes
+{
+    default         Gauss linear;       // the viscous stress term (its name differs between versions)
+    div(phi,U)      bounded Gauss linearUpwind grad(U);
+    div(phi,e)      bounded Gauss upwind;
+    div(phi,h)      bounded Gauss upwind;
+    div(phi,K)      bounded Gauss upwind;
+    div(phi,Ekp)    bounded Gauss upwind;
+    div(phi,k)      bounded Gauss upwind;
+    div(phi,omega)  bounded Gauss upwind;
+    div(phid,p)     Gauss upwind;       // transonic formulation
+}
+
+laplacianSchemes
+{
+    default         Gauss linear limited corrected 0.33;
+}
+
+interpolationSchemes
+{
+    default         linear;
+}
+
+snGradSchemes
+{
+    default         limited corrected 0.33;
+}
+
+wallDist
+{
+    method          meshWave;
+}
+"""
+
+_FVSOLUTION_C = """
+solvers
+{
+    p
+    {
+        solver          GAMG;
+        smoother        GaussSeidel;
+        tolerance       1e-7;
+        relTol          0.05;
+    }
+    "(U|e|h|k|omega)"
+    {
+        solver          smoothSolver;
+        smoother        GaussSeidel;
+        nSweeps         2;
+        tolerance       1e-8;
+        relTol          0.1;
+    }
+}
+
+SIMPLE
+{
+    nNonOrthogonalCorrectors 1;
+    consistent      no;
+    transonic       @@transonic@@;
+    pMinFactor      0.4;
+    pMaxFactor      1.6;
+}
+
+relaxationFactors
+{
+    fields
+    {
+        p               0.3;
+        rho             0.05;
+    }
+    equations
+    {
+        U               0.5;
+        "(e|h)"         0.3;
+        "(k|omega)"     0.5;
+    }
+}
+"""
+
+# compressible: keep the temperature physical in the first iterations (skewed snapped cells next to
+# a fast blade otherwise drive it negative and stop the solver)
+_FVOPTIONS_C = """
+limitT
+{
+    type            limitTemperature;
+    active          yes;
+    selectionMode   all;
+    min             @@tmin@@;
+    max             @@tmax@@;
+    limitTemperatureCoeffs { selectionMode all; min @@tmin@@; max @@tmax@@; }    // older syntax
+}
+"""
+
 # openfoam.org v11+ (foamRun) reads its steady-state controls from a PIMPLE dictionary
 _FVSOLUTION_PIMPLE = """
 PIMPLE
@@ -1229,8 +1452,7 @@ functions
         writeInterval   1;
         log             false;
         patches         ("prop.*");
-        rho             rhoInf;     // incompressible: kinematic pressure times rhoInf
-        rhoInf          @@rho@@;
+        @@rho@@
         CofR            (0 0 0);    // on the spin axis, so moment_z is the shaft torque
     }
 }
@@ -2030,8 +2252,11 @@ def _kill_run(case_dir, install, proc):
 
 # --------------------------------------------------------------------------- results
 
-def read_results(case_dir) -> CFDResult:
+def read_results(case_dir, hub_radius=None) -> CFDResult:
     """Thrust, torque and power from postProcessing/forces of a (running or finished) case.
+
+    hub_radius: where the BEMT's analysed span starts [m] (default: as stored with the case); the
+    forces inside it (hub, blade roots), which the BEMT leaves out, are reported separately.
 
     Averages over the last 15 % of the iterations (at least the last 3 force samples); converged =
     thrust and torque vary by less than +-2 % over that window. Works while the solver is still
@@ -2087,16 +2312,105 @@ def read_results(case_dir) -> CFDResult:
             ltxt = f.read()[-20000:]
         if re.search(r"FOAM FATAL|Floating point exception(?! trapping)|\bnan\b", ltxt):     # not the banner
             msg += "; the solver log reports an error (see log.solver)"
-    return CFDResult(True, thrust=T, torque=Q, power=Q * omega, rpm=rpm, iterations=hist[-1][0],
-                     converged=converged, history=hist, log_path=log, message=msg)
+    res = CFDResult(True, thrust=T, torque=Q, power=Q * omega, rpm=rpm, iterations=hist[-1][0],
+                    converged=converged, history=hist, log_path=log, message=msg)
+    _hub_and_caveats(res, case_dir, info, ts, spin, t, n, hub_radius)
+    return res
 
 
-def _read_forces(post_dir):
+def _hub_and_caveats(res, case_dir, info, ts, spin, t, n, hub_radius):
+    """Fill the hub forces (inside the BEMT's analysed span) and the BEMT-comparison caveats."""
+    r_split = float(hub_radius if hub_radius is not None else info.get("hub_radius") or 0.0)
+    res.hub_radius = r_split
+    if r_split > 0:
+        th, Fh, Mh = _read_forces(os.path.join(case_dir, "postProcessing"), HUB_FORCES)
+        if len(th) and abs(float(info.get("hub_radius") or 0) - r_split) < 1e-9:
+            # same samples as the totals (written together); average the same window
+            keep = np.isin(np.round(th, 6), np.round(t[-n:], 6))
+            if keep.any():
+                res.hub_thrust = float((ts * Fh[keep, 2]).mean())
+                res.hub_torque = float((-spin * Mh[keep, 2] if spin else np.abs(Mh[keep, 2])).mean())
+        if res.hub_thrust is None and not os.path.exists(os.path.join(case_dir, ".allrun.pid")):
+            try:
+                fin = _final_hub_forces(case_dir, info, r_split)
+            except Exception:
+                fin = None
+            if fin is not None:
+                Fh1, Mh1, _ = fin
+                res.hub_thrust = float(ts * Fh1[2])
+                res.hub_torque = float(-spin * Mh1[2] if spin else abs(Mh1[2]))
+                res.hub_final_only = True
+    omega = abs(info.get("omega", 0.0))
+    R = float(info.get("radius", 0.0))
+    V = float(info.get("airspeed", 0.0))
+    res.tip_mach = float(np.hypot(omega * R, V) / A_SOUND_CFD)
+    if res.hub_thrust is not None:
+        res.notes.append(f"hub + blade roots (r < {r_split * 1e3:.1f} mm, not in the BEMT): "
+                         f"{res.hub_thrust:+.2f} N, {res.hub_torque:+.4f} N m"
+                         + (" (last fields)" if res.hub_final_only else "") + "; the table compares the blades alone")
+        if V > 30 and res.hub_thrust < -0.05 * max(abs(res.thrust), 1e-9):
+            res.notes.append("the bare hub's drag is real at this speed: a spinner removes most of it")
+    if info.get("air") == "compressible":
+        res.notes.append(f"compressible air (rhoSimpleFoam), tip Mach {res.tip_mach:.2f}"
+                         + ("; past Mach 0.9 shocks make both the CFD and the BEMT rough" if res.tip_mach > 0.9 else ""))
+    elif res.tip_mach > INCOMPRESSIBLE_MACH and info.get("solver", "simpleFoam") == "simpleFoam":
+        m75 = float(np.hypot(0.75 * omega * R, V) / A_SOUND_CFD)
+        pg = 1 / math.sqrt(max(1 - min(m75, 0.95) ** 2, 1e-3))
+        res.notes.append(f"tip Mach {res.tip_mach:.2f}: the solver is incompressible and misses the compressibility "
+                         f"lift gain (about x{pg:.2f} at 75 % R) and shocks, so expect CFD below the BEMT"
+                         + ("; past Mach 0.8 neither is reliable" if res.tip_mach > 0.8 else ""))
+
+
+HUB_FORCES = "forcesHub"     # postProcessing folder of the forces inside the BEMT's analysed span
+INCOMPRESSIBLE_MACH = 0.6    # above this helical tip Mach number the incompressible solver misses real loads
+
+
+def _comp(info):
+    """Compressible-case data for the force integration (None for an incompressible case)."""
+    if info.get("air") != "compressible":
+        return None
+    return dict(p_inf=float(info["p_inf"]), mu=float(info.get("mu") or 1.81e-5))
+
+
+def _final_hub_forces(case_dir, info, r_split):
+    """Hub forces (force, moment) from the newest written fields of a finished case without a
+    forcesHub history (cases written before PropSim split them); cached in postProcessing/forcesHub."""
+    cache = os.path.join(case_dir, "postProcessing", HUB_FORCES, "final.json")
+    try:
+        with open(cache) as f:
+            c = json.load(f)
+        if abs(c.get("hub_radius", -1) - r_split) < 1e-9:
+            return np.array(c["force"]), np.array(c["moment"]), c["time"]
+    except (OSError, ValueError, KeyError):
+        pass
+    roots = sorted(glob.glob(os.path.join(glob.escape(case_dir), "processor[0-9]*")),
+                   key=lambda p: int(re.sub(r"\D", "", os.path.basename(p))))
+    roots = roots or [case_dir]
+    times = _time_dirs(roots[0])
+    if not times:
+        return None
+    t = times[-1]
+    if not all(os.path.exists(os.path.join(r, t, "p")) for r in roots):
+        return None
+    meshes = _cached_meshes(case_dir, roots)
+    omega, rho, nu = info.get("omega", 0.0), info.get("rho", 1.225), info.get("nu", 1.5e-5)
+    fm = [_forces_one(r, t, meshes[r], omega, rho, nu, r_split, _comp(info)) for r in roots]
+    Fh, Mh = sum(x[2] for x in fm), sum(x[3] for x in fm)
+    try:
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        with open(cache, "w") as f:
+            json.dump(dict(hub_radius=r_split, time=t, force=list(map(float, Fh)), moment=list(map(float, Mh))), f)
+    except OSError:
+        pass
+    return Fh, Mh, t
+
+
+def _read_forces(post_dir, name="forces"):
     """(time, total force Nx3, total moment Nx3) from the forces function object, any version:
     ESI v1906+ force.dat + moment.dat, openfoam.org 10+ forces.dat + moments.dat, or the older
     combined forces.dat with ((pressure) (viscous) (porous)) vectors. Restarts (several time
     folders) are joined, later data replacing earlier."""
-    base = os.path.join(post_dir, "forces")
+    base = os.path.join(post_dir, name)
     empty = np.zeros(0), np.zeros((0, 3)), np.zeros((0, 3))
     if not os.path.isdir(base):
         return empty
@@ -2319,12 +2633,14 @@ def _face_geometry(points, off, lab, fidx):
     return C, S
 
 
-def _forces_one(root, tname, mesh, omega, rho, nu):
-    """(force, moment) on the prop faces of one mesh (one processor) at one time, each as
-    total, pressure and viscous xyz (9 values)."""
+def _forces_one(root, tname, mesh, omega, rho, nu, r_split=0.0, comp=None):
+    """(force, moment, hub force, hub moment) on the prop faces of one mesh (one processor) at one
+    time, each as total, pressure and viscous xyz (9 values); hub = the faces closer to the axis than
+    r_split (zeros when r_split is 0). comp = dict(p_inf, mu) for a compressible case (absolute
+    pressure in Pa, the density field rho)."""
     props = [(n, s, c) for n, s, c in mesh["patches"] if n.startswith("prop") and c > 0]
     if not props:
-        return np.zeros(9), np.zeros(9)
+        return np.zeros(9), np.zeros(9), np.zeros(9), np.zeros(9)
     sel = np.concatenate([np.arange(s, s + c) for _, s, c in props])
     owner, nb = mesh["owner"], mesh["neighbour"]
     cells = np.unique(owner[sel])
@@ -2365,15 +2681,30 @@ def _forces_one(root, tname, mesh, omega, rho, nu):
                            for nm, _, c in props])
     oc = owner[sel]
     p_c = p[oc] if len(p) > 1 else np.full(len(sel), p[0])          # (a uniform value has one entry)
+    if comp:
+        try:
+            r_f, _ = _field_values(os.path.join(tdir, "rho"), [], 1)
+        except (OSError, ValueError):
+            T_f, _ = _field_values(os.path.join(tdir, "T"), [], 1)
+            r_f = p / (R_AIR * T_f)
+        rho_c = r_f[oc] if len(r_f) > 1 else np.full(len(sel), r_f[0])
     U_c = U[oc] if U.ndim == 2 else np.broadcast_to(U, (len(sel), 3))
     U_w = omega * np.column_stack([-Cf[:, 1], Cf[:, 0], np.zeros(len(Cf))])   # prop faces turn with the MRF zone
     dU = U_c - U_w
     dU -= np.einsum("ij,ij->i", dU, n)[:, None] * n
-    f_p = rho * p_c[:, None] * Sf
-    f_v = rho * (nu + nutw)[:, None] * dU / y[:, None] * Af[:, None]
-    fp, fv = f_p.sum(0), f_v.sum(0)
-    mp, mv = np.cross(Cf, f_p).sum(0), np.cross(Cf, f_v).sum(0)      # about CofR = origin
-    return np.concatenate([fp + fv, fp, fv]), np.concatenate([mp + mv, mp, mv])
+    if comp:
+        f_p = (p_c - comp["p_inf"])[:, None] * Sf
+        f_v = (comp["mu"] + rho_c * nutw)[:, None] * dU / y[:, None] * Af[:, None]
+    else:
+        f_p = rho * p_c[:, None] * Sf
+        f_v = rho * (nu + nutw)[:, None] * dU / y[:, None] * Af[:, None]
+    out = []
+    hub = np.hypot(Cf[:, 0], Cf[:, 1]) < r_split
+    for sel_ in (slice(None), hub):
+        fp, fv = f_p[sel_].sum(0), f_v[sel_].sum(0)
+        mp, mv = np.cross(Cf[sel_], f_p[sel_]).sum(0), np.cross(Cf[sel_], f_v[sel_]).sum(0)    # about CofR = origin
+        out += [np.concatenate([fp + fv, fp, fv]), np.concatenate([mp + mv, mp, mv])]
+    return tuple(out)
 
 
 def _time_dirs(root):
@@ -2406,6 +2737,8 @@ def _update_field_forces(case_dir, running, purge=False):
         if running:
             times = times[:-1]
         out = os.path.join(case_dir, "postProcessing", "forces", "0")
+        out_hub = os.path.join(case_dir, "postProcessing", HUB_FORCES, "0")
+        r_split = float(info.get("hub_radius") or 0.0)
         done = set()
         if os.path.exists(os.path.join(out, "force.dat")):
             done = {round(t, 6) for t in _vector_file(os.path.join(out, "force.dat"))[0]}
@@ -2414,11 +2747,17 @@ def _update_field_forces(case_dir, running, purge=False):
             os.makedirs(out, exist_ok=True)
             meshes = _cached_meshes(case_dir, roots)
             omega, rho, nu = info.get("omega", 0.0), info.get("rho", 1.225), info.get("nu", 1.5e-5)
+            if r_split > 0:
+                os.makedirs(out_hub, exist_ok=True)
             for t in todo:
-                fm = [_forces_one(r, t, meshes[r], omega, rho, nu) for r in roots]
+                fm = [_forces_one(r, t, meshes[r], omega, rho, nu, r_split, _comp(info)) for r in roots]
                 F, M = sum(x[0] for x in fm), sum(x[1] for x in fm)
-                for name, vec in (("force.dat", F), ("moment.dat", M)):
-                    path = os.path.join(out, name)
+                Fh, Mh = sum(x[2] for x in fm), sum(x[3] for x in fm)
+                for d_, name, vec in ((out, "force.dat", F), (out, "moment.dat", M), (out_hub, "force.dat", Fh),
+                                      (out_hub, "moment.dat", Mh)):
+                    if d_ is out_hub and r_split <= 0:
+                        continue
+                    path = os.path.join(d_, name)
                     new = not os.path.exists(path)
                     with open(path, "a", newline="\n") as fh:
                         if new:
@@ -2453,6 +2792,9 @@ def main(argv=None):
     ap.add_argument("--flavor", choices=["esi", "foundation"], help="write for this flavour (default: detected)")
     ap.add_argument("--foam-version", default="", help="OpenFOAM version for --flavor (e.g. 11, 2406)")
     ap.add_argument("--reverse-spin", action="store_true", help="spin the prop backwards (sign check)")
+    ap.add_argument("--air", default="auto", choices=["auto", "incompressible", "compressible"],
+                    help="air model: compressible (rhoSimpleFoam) or incompressible (simpleFoam); auto = "
+                         f"compressible above tip Mach {COMPRESSIBLE_AUTO_MACH:g} (default)")
     ap.add_argument("--results", metavar="CASE", help="only read and print the results of an existing case")
     ap.add_argument("--run-case", metavar="CASE", help="run an existing case with the detected OpenFOAM "
                     "(the bundled engine needs no bash) and print the results")
@@ -2490,7 +2832,7 @@ def main(argv=None):
     case = a.case or f"cfd_{stem}_{a.rpm:.0f}rpm"
     st = CaseSettings(rpm=a.rpm, airspeed=a.airspeed, rho=a.rho, resolution=a.resolution, n_procs=a.procs,
                       iterations=a.iterations, flavor=a.flavor or "", version=a.foam_version,
-                      reverse_spin=a.reverse_spin)
+                      reverse_spin=a.reverse_spin, air=a.air, bemt=bemt_record(out, pargs))
     inst = detect_openfoam()
     print(inst.message)
     info = write_case(case, out.mesh, out.geom, st)
@@ -2499,7 +2841,8 @@ def main(argv=None):
           f"(estimated {info['est_cells'] / 1e6:.2f} M cells), {info['n_procs']} processes, "
           f"{info['iterations']} iterations, {abs(info['omega']):.1f} rad/s turning "
           f"{'+' if info['model_spin_sign'] > 0 else '-'} about the model's +{ax} axis (right-hand rule), "
-          f"thrust towards {'+' if info['thrust_sign'] > 0 else '-'}{ax}")
+          f"thrust towards {'+' if info['thrust_sign'] > 0 else '-'}{ax}; {info['air']} air ({info['solver']}), "
+          f"tip Mach {info['tip_mach']:.2f}")
     for n in info["notes"]:
         print("  note:", n)
     r = out.res
@@ -2552,15 +2895,30 @@ def _run_and_report(info, inst, bemt_line=None, bemt=None):
     print_result(box.get("res") or read_results(info["case_dir"]), bemt)
 
 
+def bemt_record(out, argv):
+    """What a case stores about the BEMT run it is made from (CaseSettings.bemt)."""
+    r = out.res
+    return dict(thrust=float(r.thrust), torque=float(r.torque), power=float(r.power), rpm=float(r.rpm),
+                stalled_fraction=float(r.stalled_fraction), hub_radius=float(out.geom.hub_radius),
+                argv=[str(x) for x in argv])
+
+
 def print_result(res: CFDResult, bemt=None):
     if not res.history:
         print("CFD: no result -", res.message)
         return
     print(f"CFD (OpenFOAM):  thrust {res.thrust:8.3f} N   torque {res.torque:8.4f} N m   power {res.power:7.1f} W"
           f"   ({res.iterations} iterations)")
+    if res.hub_thrust is not None:
+        print(f"  blades only:   thrust {res.blade_thrust:8.3f} N   torque {res.blade_torque:8.4f} N m   "
+              f"(hub and roots inside r = {res.hub_radius * 1e3:.1f} mm: {res.hub_thrust:+.3f} N, "
+              f"{res.hub_torque:+.4f} N m)")
     if bemt is not None and bemt.thrust and bemt.torque:
-        print(f"CFD / BEMT:      thrust {res.thrust / bemt.thrust:8.2f}     torque {res.torque / bemt.torque:8.2f}")
+        print(f"CFD / BEMT:      thrust {res.blade_thrust / bemt.thrust:8.2f}     torque "
+              f"{res.blade_torque / bemt.torque:8.2f}" + ("   (blades only)" if res.hub_thrust is not None else ""))
     print(("" if res.ok else "FAILED: ") + res.message)
+    for n in res.notes:
+        print("  note:", n)
 
 
 if __name__ == "__main__":

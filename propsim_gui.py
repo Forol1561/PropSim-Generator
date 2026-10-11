@@ -45,6 +45,7 @@ except Exception as _exc:  # noqa: BLE001 - the app works without the 3D CFD mod
 
 try:
     import propgen  # noqa: E402
+    import hubgeom  # noqa: E402
     GEN_IMPORT_ERROR = ""
 except Exception as _exc:  # noqa: BLE001 - ... and without the propeller generator
     propgen = None
@@ -332,8 +333,108 @@ def fmt_si(v, digits=3):
 
 # --------------------------------------------------------------------------- small widgets
 
+def bind_redraw(canvas):
+    """Redraw a canvas widget when its size changes: once per idle round however many <Configure>
+    events arrive (a window resize sends dozens), and not at all when only its position changed."""
+    state = {"size": None, "job": None}
+
+    def run():
+        state["job"] = None
+        try:
+            canvas.redraw()
+        except tk.TclError:
+            pass
+
+    def on_configure(e):
+        size = (e.width, e.height)
+        if size == state["size"]:
+            return
+        state["size"] = size
+        if state["job"] is None:
+            state["job"] = canvas.after_idle(run)
+
+    canvas.bind("<Configure>", on_configure)
+
+
+class SmoothScroll:
+    """Mouse-wheel scrolling for customtkinter scrollable frames, replacing their own handler.
+
+    customtkinter moves the content once per wheel event (20 px a notch on Windows) and recomputes
+    the scroll region every time the content moves; each move repaints every widget in the panel,
+    so a fast spin of the wheel queues more repaints than the screen can show and the panel lags,
+    tears and keeps scrolling after the wheel has stopped. Here the wheel only adds to a pending
+    distance, applied at most once per frame (~60 per second) in one move, and the scroll region
+    is updated only when the content's size changes."""
+
+    PX_PER_NOTCH = 60
+    FRAME_MS = 16
+
+    def __init__(self, root):
+        self.root, self.frames, self.pending, self.job = root, [], {}, None
+        root.unbind_all("<MouseWheel>")
+        root.unbind_all("<Button-4>")
+        root.unbind_all("<Button-5>")
+        root.bind_all("<MouseWheel>", lambda e: self._wheel(e, e.delta / 120.0), add="+")
+        root.bind_all("<Button-4>", lambda e: self._wheel(e, 1.0), add="+")
+        root.bind_all("<Button-5>", lambda e: self._wheel(e, -1.0), add="+")
+
+    def add(self, sc):
+        cv = sc._parent_canvas          # customtkinter keeps the scrolling canvas here (no public API)
+        cv.configure(yscrollincrement=1)
+        size = {"v": None}
+
+        def on_configure(e):
+            if (e.width, e.height) != size["v"]:
+                size["v"] = (e.width, e.height)
+                cv.configure(scrollregion=cv.bbox("all"))
+        tk.Frame.bind(sc, "<Configure>", on_configure)      # replaces customtkinter's per-move update
+        self.frames.append((str(cv), cv))
+
+    def _target(self, widget):
+        try:
+            path = str(widget)
+        except Exception:  # noqa: BLE001
+            return None
+        for name, cv in self.frames:
+            if path == name or path.startswith(name + "."):
+                return cv
+        return None
+
+    def _wheel(self, e, notches):
+        Tooltip.hide_all()
+        # the widget under the pointer: Tk on Windows delivers wheel events to the focus widget
+        try:
+            w = self.root.winfo_containing(e.x_root, e.y_root)
+        except (tk.TclError, KeyError, AttributeError):
+            w = None
+        if w is None or isinstance(w, str):
+            return
+        if isinstance(w, (tk.Text, ctk.CTkTextbox)) or isinstance(getattr(w, "master", None), ctk.CTkTextbox):
+            return          # text boxes scroll themselves
+        cv = self._target(w)
+        if cv is None or cv.yview() == (0.0, 1.0):
+            return
+        self.pending[cv] = self.pending.get(cv, 0.0) - notches * px(self.PX_PER_NOTCH)
+        if self.job is None:
+            self.job = self.root.after(self.FRAME_MS, self._flush)
+
+    def _flush(self):
+        self.job = None
+        for cv, d in list(self.pending.items()):
+            n = int(d)
+            self.pending[cv] = d - n
+            if n:
+                try:
+                    cv.yview_scroll(n, "units")
+                except tk.TclError:
+                    self.pending.pop(cv, None)
+
 class Tooltip:
-    """Hover help for a widget."""
+    """Hover help for a widget. At most one is shown; scrolling, moving or resizing the window and
+    switching tabs hide it (Tk sends no <Leave> when a widget moves away under a still pointer, so a
+    tooltip would otherwise stay behind, floating where its widget used to be)."""
+
+    _live: set = set()
 
     def __init__(self, widget, text):
         self.widget, self.text, self.win, self.job = widget, text, None, None
@@ -341,22 +442,49 @@ class Tooltip:
         widget.bind("<Leave>", self._leave, add="+")
         widget.bind("<ButtonPress>", self._leave, add="+")
 
+    @classmethod
+    def hide_all(cls, _e=None):
+        for t in list(cls._live):
+            t._leave()
+
     def _enter(self, _e=None):
         if self.job is None:
             self.job = self.widget.after(450, self._show)
+            Tooltip._live.add(self)
 
     def _leave(self, _e=None):
         if self.job:
-            self.widget.after_cancel(self.job)
+            try:
+                self.widget.after_cancel(self.job)
+            except tk.TclError:
+                pass
             self.job = None
         if self.win:
-            self.win.destroy()
+            try:
+                self.win.destroy()
+            except tk.TclError:
+                pass
             self.win = None
+        Tooltip._live.discard(self)
+
+    def _pointer_inside(self):
+        """Is the mouse still over the widget (it may have scrolled away)?"""
+        try:
+            x, y = self.widget.winfo_pointerxy()
+            w = self.widget.winfo_containing(x, y)
+        except (tk.TclError, KeyError):
+            return False
+        return w is not None and str(w).startswith(str(self.widget))
 
     def _show(self):
         self.job = None
-        if self.win or not self.text:
+        if self.win or not self.text or not self._pointer_inside():
+            Tooltip._live.discard(self)
             return
+        for t in list(Tooltip._live):         # one tooltip at a time
+            if t is not self:
+                t._leave()
+        Tooltip._live.add(self)
         x = self.widget.winfo_rootx() + px(8)
         y = self.widget.winfo_rooty() + self.widget.winfo_height() + px(4)
         self.win = tw = tk.Toplevel(self.widget)
@@ -374,7 +502,7 @@ class CardHeader(tk.Canvas):
         super().__init__(master, height=px(34), bg=bg, highlightthickness=0, bd=0)
         self.title, self.index, self.bgc, self.accent = title, index, bg, accent
         self.right, self.right_color = right, MUTED
-        self.bind("<Configure>", lambda _e: self.redraw())
+        bind_redraw(self)
 
     def set_right(self, text, color=MUTED):
         self.right, self.right_color = text, color
@@ -406,7 +534,7 @@ class GlowButton(tk.Canvas):
         self.hover = self.busy = False
         self.busy_text = ""
         self.phase = 0.0
-        self.bind("<Configure>", lambda _e: self.redraw())
+        bind_redraw(self)
         self.bind("<Enter>", lambda _e: self._set_hover(True))
         self.bind("<Leave>", lambda _e: self._set_hover(False))
         self.bind("<ButtonRelease-1>", lambda _e: (not self.busy) and self.command())
@@ -479,7 +607,7 @@ class TabBar(tk.Canvas):
         self.tabs, self.command, self.bgc = tabs, command, bg
         self.sel, self.hover, self.badges, self.hit = tabs[0][0], None, {}, []
         self.right_text = ""
-        self.bind("<Configure>", lambda _e: self.redraw())
+        bind_redraw(self)
         self.bind("<Motion>", lambda e: self._set_hover(self._at(e.x)))
         self.bind("<Leave>", lambda _e: self._set_hover(None))
         self.bind("<Button-1>", self._click)
@@ -551,7 +679,7 @@ class StatusBar(tk.Canvas):
         super().__init__(master, height=px(30), bg=bg, highlightthickness=0, bd=0)
         self.bgc, self.text, self.state, self.right = bg, "Ready", "idle", ""
         self.phase = 0
-        self.bind("<Configure>", lambda _e: self.redraw())
+        bind_redraw(self)
 
     def set(self, text, state=None, right=None):
         self.text = text
@@ -607,7 +735,7 @@ class AppHeader(tk.Canvas):
     def __init__(self, master, bg=BG):
         super().__init__(master, height=px(64), bg=bg, highlightthickness=0, bd=0)
         self.bgc, self.chips, self.angle, self.busy = bg, {}, 0.0, False
-        self.bind("<Configure>", lambda _e: self.redraw())
+        bind_redraw(self)
 
     def set_chip(self, key, text, color):
         self.chips[key] = (text, color)
@@ -719,7 +847,7 @@ class KpiTile(tk.Canvas):
         self.label, self.accent, self.hero, self.bgc = label, accent, hero, bg
         self.d = dict(value="—", unit="", sub="", extra=(), bar=None, warn=False)
         self.stale = False          # inputs changed since this value was computed
-        self.bind("<Configure>", lambda _e: self.redraw())
+        bind_redraw(self)
 
     def set(self, value="—", unit="", sub="", extra=(), bar=None, warn=False, label=None):
         if label:
@@ -795,7 +923,7 @@ class ModelStrip(tk.Canvas):
         self.bgc = bg
         self.name, self.chips, self.warnings = "", [], []
         self.empty, self.stale = "", False
-        self.bind("<Configure>", lambda _e: self.redraw())
+        bind_redraw(self)
 
     def set(self, name, chips, warnings):
         self.name, self.chips, self.warnings = name, chips, warnings[:3]
@@ -861,7 +989,7 @@ class LineChart(tk.Canvas):
         self.x, self.series, self.marker, self.bands, self.hlines = None, [], None, [], []
         self.band_label, self.yfrom = "", None
         self.geo = None
-        self.bind("<Configure>", lambda _e: self.redraw())
+        bind_redraw(self)
         self.bind("<Motion>", self._hover)
         self.bind("<Leave>", lambda _e: self.delete("hover"))
 
@@ -956,6 +1084,8 @@ class LineChart(tk.Canvas):
         if self.hlines and short:       # no room to label the reference lines in place
             items.insert(0, (self.hlines[0][3].split(" ")[0], [hl[2] for hl in self.hlines], "ref"))
         for label, col, dash in items:
+            if not label:               # series kept out of the legend
+                continue
             if xr - lf.measure(label) - px(22) < title_end:
                 break
             t = self.create_text(xr, px(20), text=label, anchor="e", font=lf, fill=TEXT2)
@@ -1133,6 +1263,51 @@ def section_loop(sec, tc, camber, xs):
     return np.column_stack([np.r_[xs[::-1], xs[1:]], np.r_[yu[::-1], yl[1:]]])
 
 
+def rasterize(X, Y, F, rgb, W, H, bg):
+    """Flat-shaded triangles (given far to near) into an (H, W, 3) uint8 image, scanline by scanline and
+    vectorised over all triangles; nearer ones overwrite farther ones (painter's algorithm). Tk draws a
+    few thousand canvas polygons far too slowly for a turning model; this takes milliseconds."""
+    img = np.empty((H, W, 3), np.uint8)
+    img[:] = bg
+    if len(F) == 0:
+        return img
+    x, y = X[F], Y[F]
+    ys0 = np.maximum(np.ceil(y.min(1) - 0.5).astype(np.int64), 0)
+    ys1 = np.minimum(np.floor(y.max(1) - 0.5).astype(np.int64), H - 1)
+    nrow = ys1 - ys0 + 1
+    tid = np.nonzero(nrow > 0)[0]
+    nr = nrow[tid]
+    if nr.sum() == 0:
+        return img
+    t = np.repeat(tid, nr)
+    row = ys0[t] + (np.arange(nr.sum()) - np.repeat(np.cumsum(nr) - nr, nr))
+    yc = row + 0.5
+    xl = np.full(len(t), 1e9)
+    xr = np.full(len(t), -1e9)
+    for a, b in ((0, 1), (1, 2), (2, 0)):
+        xa, ya, xb, yb = x[t, a], y[t, a], x[t, b], y[t, b]
+        lo, hi = np.minimum(ya, yb), np.maximum(ya, yb)
+        on = (yc >= lo) & (yc <= hi) & (hi > lo)
+        xi = xa + (yc - ya) * (xb - xa) / np.where(hi > lo, yb - ya, 1.0)
+        xl = np.where(on, np.minimum(xl, xi), xl)
+        xr = np.where(on, np.maximum(xr, xi), xr)
+    c0 = np.maximum(np.ceil(xl - 0.5).astype(np.int64), 0)
+    c1 = np.minimum(np.floor(xr - 0.5).astype(np.int64), W - 1)
+    n = np.maximum(c1 - c0 + 1, 0)
+    keep = n > 0
+    t, row, c0, n = t[keep], row[keep], c0[keep], n[keep]
+    tot = int(n.sum())
+    if tot:
+        col = np.repeat(c0, n) + (np.arange(tot) - np.repeat(np.cumsum(n) - n, n))
+        img.reshape(-1, 3)[np.repeat(row, n) * W + col] = rgb[np.repeat(t, n)]
+    return img
+
+
+def _rgb(hexcol):
+    v = int(hexcol[1:], 16)
+    return (v >> 16) & 255, (v >> 8) & 255, v & 255
+
+
 class PropView(tk.Canvas):
     """Wireframe of the analysed blades (measured sections placed at their chord and blade angle),
     coloured by local thrust. Turns in the prop's own sense for a while after a new result or a touch,
@@ -1149,7 +1324,8 @@ class PropView(tk.Canvas):
         self.drag, self.resume_at, self.empty_phase = None, 0.0, 0.0
         self.t_label, self.job, self.active_until = None, None, 0.0
         self.empty_text = "Awaiting model"
-        self.bind("<Configure>", lambda _e: self.redraw())
+        self.solid, self.mode, self.toggle_box, self.bg_top = None, "model", None, None
+        bind_redraw(self)
         self.bind("<ButtonPress-1>", self._press)
         self.bind("<B1-Motion>", self._motion)
         self.bind("<ButtonRelease-1>", self._release)
@@ -1172,14 +1348,44 @@ class PropView(tk.Canvas):
             self._draw_empty()
 
     def clear(self):
-        self.lines, self.P = [], None
+        self.lines, self.P, self.solid = [], None, None
         self.redraw()
         self.wake()
+
+    # shaded solid: the real model (every feature), painter's algorithm with back faces culled
+    N_SHADE = 24
+
+    def set_solid(self, V, F, frame=None):
+        """Show this triangle mesh (model units, e.g. the generator's mm) shaded, in the frame of the last
+        set_model (frame: a function mapping model points to the analysis frame); set_model first."""
+        if self.P is None or V is None or len(F) == 0:
+            self.solid = None
+            return
+        R = self.solid_R
+        Vn = (frame(np.asarray(V, float)) if frame else np.asarray(V, float)) / R
+        F = np.asarray(F, int)
+        a, b, c = Vn[F[:, 0]], Vn[F[:, 1]], Vn[F[:, 2]]
+        Nf = np.cross(b - a, c - a)
+        Nf /= np.maximum(np.linalg.norm(Nf, axis=1), 1e-12)[:, None]
+        rc = np.clip(np.hypot(*((a + b + c) / 3)[:, :2].T), 0, 1)
+        # colour along the radius: violet hub to cyan tip, darker or lighter with the light
+        base = [blend(VIOLET, CYAN, t) for t in np.linspace(0, 1, 8)]
+        self.palette = np.array([[_rgb(blend(blend(CARD, col, 0.18 + 0.82 * k / (self.N_SHADE - 1)), "#ffffff",
+                                             max(0.0, (k / (self.N_SHADE - 1) - 0.85) * 1.6)))
+                                  for k in range(self.N_SHADE)] for col in base], np.uint8)
+        self.solid = dict(V=Vn, F=F, N=Nf, ci=np.minimum((rc * 8).astype(int), 7))
+        if self.mode == "model":
+            self.redraw()
+
+    def _toggle_mode(self):
+        self.mode = "sections" if self.mode == "model" else "model"
+        self.redraw()
 
     def set_model(self, geom, mesh, res=None, pod=None):
         """pod: a generated single blade's counterweight (propgen PropDesign.counterweight), drawn opposite
         the blade."""
         R, n, B = float(geom.radius), len(geom.r), int(geom.blades)
+        self.solid_R, self.solid = R, None
         self.spin = geom.spin_sign or 1
         th_sign = geom.thrust_sign or 1
         nx = self.NX
@@ -1194,6 +1400,12 @@ class PropView(tk.Canvas):
         else:
             load, stalled = np.zeros(n), np.zeros(n, bool)
         show = sorted(set(range(0, n, max(1, n // 13))) | {n - 1})
+        # a swept blade: sections displaced along the direction of travel (negative = swept back)
+        sw = getattr(geom, "sweep", None)
+        off = np.zeros(n)
+        if sw is not None and len(sw) == n:
+            t_ = np.tan(np.asarray(sw, float))
+            off[1:] = -np.cumsum(0.5 * (t_[1:] + t_[:-1]) * np.diff(np.asarray(geom.r, float)))
         lines = []      # (points (m, 3) in units of R, kind, colour)
         ea = np.array([0.0, 0.0, float(th_sign)])
         for k in range(B):
@@ -1206,7 +1418,7 @@ class PropView(tk.Canvas):
                 ec = -math.cos(b) * et - math.sin(b) * ea     # leading edge -> trailing edge
                 en = -math.sin(b) * et + math.cos(b) * ea     # towards the suction side
                 s = (loops[i][:, 0] - 0.25) * c
-                P[i] = geom.r[i] * er + s[:, None] * ec + (loops[i][:, 1] * c)[:, None] * en
+                P[i] = geom.r[i] * er + off[i] * et + s[:, None] * ec + (loops[i][:, 1] * c)[:, None] * en
             P /= R
             for i in show:
                 lines.append((np.vstack([P[i], P[i][:1]]), "sec", AMBER if stalled[i] else ramp(load[i])))
@@ -1266,6 +1478,10 @@ class PropView(tk.Canvas):
         self.wake()
 
     def _press(self, e):
+        tb = self.toggle_box
+        if tb and tb[0] <= e.x <= tb[2] and tb[1] <= e.y <= tb[3]:
+            self._toggle_mode()
+            return
         self.drag = (e.x, e.y, self.yaw, self.elev)
         self.wake()
 
@@ -1321,13 +1537,31 @@ class PropView(tk.Canvas):
             return
         round_rect(self, 1, 1, w - 2, h - 2, px(12), fill=CARD, outline=BORDER)
         self.create_line(px(6), px(18), px(6), px(6), px(18), px(6), fill=CYAN, width=px(2))
+        self.bg_top = self.find_all()[-1] if self.find_all() else None
         self.create_text(px(18), px(20), text=spaced("3D model"), anchor="w", font=cfont(11, "bold"), fill=TEXT)
-        self.create_text(w - px(16), px(20), text="BEMT blade sections", anchor="e", font=cfont(11), fill=MUTED)
         self.items = []
+        self.toggle_box = None
+        solid = self.solid is not None and self.mode == "model"
+        if self.solid is not None:
+            # a two-way switch: the real (shaded) model or the analysed blade sections
+            f = cfont(10, "bold")
+            labels = (("sections", "SECTIONS"), ("model", "MODEL"))
+            x0 = w - px(14) - sum(f.measure(lb) for _, lb in labels) - px(10) * len(labels)
+            bb = (x0, px(8), w - px(8), px(32))
+            self.create_rectangle(bb[0] + px(4), bb[1] + px(2), bb[2] - px(2), bb[3] - px(2), outline=BORDER,
+                                  fill=CARD)
+            x = w - px(14)
+            for key, label in labels:
+                t = self.create_text(x, px(20), text=label, anchor="e", font=f,
+                                     fill=CYAN if self.mode == key else MUTED)
+                x = self.bbox(t)[0] - px(10)
+            self.toggle_box = bb
+        else:
+            self.create_text(w - px(16), px(20), text="BEMT blade sections", anchor="e", font=cfont(11), fill=MUTED)
         if self.P is None:
             self._draw_empty()
             return
-        for pts, kind, col in self.lines:
+        for pts, kind, col in ([] if solid else self.lines):
             item = dict(kind=kind, col=col, n=len(pts))
             if kind in ("le", "te"):
                 item["g"] = self.create_line(0, 0, 0, 0, width=px(5), capstyle="round", fill=blend(col, CARD, 0.8))
@@ -1346,7 +1580,7 @@ class PropView(tk.Canvas):
         hint = next((t for t in ("drag to rotate · wheel to zoom · double-click resets",
                                  "drag · wheel · double-click resets", "drag to rotate") if f10.measure(t) <= room2), "")
         self.create_text(px(16), h - px(14), text=hint, anchor="w", font=f10, fill=MUTED)
-        if self.has_load:          # colour key
+        if self.has_load and not solid:          # colour key
             y = h - px(31)
             for i in range(40):
                 xx = x1 - px(80) + i * px(80) / 40
@@ -1357,6 +1591,9 @@ class PropView(tk.Canvas):
         self._update()
 
     def _update(self):
+        if self.solid is not None and self.mode == "model" and self.P is not None:
+            self._draw_solid()
+            return
         if self.P is None or not self.items:
             return
         X, Y, near = self._project(self.P)
@@ -1376,6 +1613,52 @@ class PropView(tk.Canvas):
                 self.coords(it["g"], xy)
         tx, ty, _ = self._project(self.thrust_tip)
         self.coords(self.t_label, float(tx[0]) + px(10), float(ty[0]))
+
+    def _draw_solid(self, quality=False):
+        """The shaded model as one image (fast render while it turns, anti-aliased once it rests)."""
+        S = self.solid
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 60 or h < 80:
+            return
+        x0, y0, x1, y1 = px(8), px(34), w - px(8), h - px(42)
+        W, H = max(x1 - x0, 1), max(y1 - y0, 1)
+        ss = 2 if quality else 1
+        V, F, Nf = S["V"], S["F"], S["N"]
+        X, Y, near = self._project(V)
+        X, Y = (X - x0) * ss, (Y - y0) * ss
+        # face normals in view space (the rotation _project uses): facing the viewer if 'near' > 0
+        cy, sy = math.cos(self.yaw), math.sin(self.yaw)
+        ce, se = math.cos(self.elev), math.sin(self.elev)
+        nx = Nf[:, 0] * cy - Nf[:, 1] * sy
+        ny = Nf[:, 0] * sy + Nf[:, 1] * cy
+        nn = Nf[:, 2] * se - ny * ce
+        nu = ny * se + Nf[:, 2] * ce
+        vis = np.nonzero(nn > -0.02)[0]
+        vis = vis[np.argsort(near[F[vis]].mean(axis=1))]       # far first
+        L = np.array([-0.45, 0.55, 0.70])
+        L /= np.linalg.norm(L)
+        inten = np.clip(0.22 + 0.78 * np.clip(nx[vis] * L[0] + nu[vis] * L[1] + nn[vis] * L[2], 0, 1), 0, 1)
+        k = np.minimum((inten * (self.N_SHADE - 1)).round().astype(int), self.N_SHADE - 1)
+        rgb = self.palette[S["ci"][vis], k]
+        img = rasterize(X, Y, F[vis], rgb, W * ss, H * ss, _rgb(CARD))
+        if ss > 1:
+            img = img.reshape(H, ss, W, ss, 3).mean(axis=(1, 3)).astype(np.uint8)
+        self.solid_img = tk.PhotoImage(data=b"P6 %d %d 255\n" % (W, H) + img.tobytes(), format="PPM")
+        if not self.find_withtag("solid"):
+            self.create_image(x0, y0, anchor="nw", tags="solid")
+            if self.bg_top:
+                self.tag_raise("solid", self.bg_top)        # above the card, below the captions
+        self.itemconfigure("solid", image=self.solid_img)
+        self.coords("solid", x0, y0)
+        if not quality:
+            if getattr(self, "hq_job", None):
+                self.after_cancel(self.hq_job)
+            self.hq_job = self.after(250, self._hq)
+
+    def _hq(self):
+        self.hq_job = None
+        if self.solid is not None and self.mode == "model" and self.P is not None:
+            self._draw_solid(quality=True)
 
     def _draw_empty(self):
         self.delete("empty")
@@ -1397,7 +1680,7 @@ class SectionView(tk.Canvas):
     def __init__(self, master, bg=BG):
         super().__init__(master, bg=bg, highlightthickness=0, bd=0, height=px(220), width=px(300))
         self.data = None
-        self.bind("<Configure>", lambda _e: self.redraw())
+        bind_redraw(self)
 
     def set(self, data):
         self.data = data
@@ -1476,11 +1759,11 @@ class App:
             "model", "units", "axis", "blades", "hub", "mode", "tip", "rpm", "power",
             "kv", "cells", "cellv", "voltage", "rm", "i0", "esc", "qmax", "drive",
             "airspeed", "rho", "polar", "clmax", "clalpha", "cd0", "aero", "nf_model", "ncrit",
-            "cfd_res", "cfd_cores", "cfd_iters")}
+            "cfd_res", "cfd_cores", "cfd_iters", "cfd_air")}
         defaults = dict(units="mm", axis="z", mode="tip", tip="150", rpm="8000", power="400",
                         cellv="3.7", esc="95", drive="85", airspeed="0", rho="1.225",
                         clmax="1.2", clalpha="5.7", aero="analytic", nf_model="large", ncrit="9",
-                        cfd_res="coarse", cfd_cores="Auto")
+                        cfd_res="coarse", cfd_cores="Auto", cfd_air="Auto")
         for k, val in defaults.items():
             self.v[k].set(val)
         self.test_prop = tk.BooleanVar(value=False)
@@ -1530,6 +1813,14 @@ class App:
         self._aero_changed()
         self._source_changed()
         self.root.bind("<Return>", self._on_return)
+        # after every scrollable frame exists (each adds a global wheel handler, replaced here)
+        self.scroller = SmoothScroll(self.root)
+        for sc in (self.left_sc, getattr(self, "gen_sc", None)):
+            if sc is not None:
+                self.scroller.add(sc)
+        # the window moved or was resized: no tooltip left floating where its widget used to be
+        self.root.bind("<Configure>", lambda e: e.widget is self.root and Tooltip.hide_all(), add="+")
+        self.root.bind("<Unmap>", lambda e: e.widget is self.root and Tooltip.hide_all(), add="+")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._pump()
         self.root.after(700, self._cfd_detect)
@@ -1548,7 +1839,7 @@ class App:
         card = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=12, border_width=1, border_color=BORDER)
         card.header = CardHeader(card, title, index, accent=accent)
         card.header.pack(fill="x", padx=px(3), pady=(px(3), 0))
-        body = ctk.CTkFrame(card, fg_color="transparent")
+        body = tk.Frame(card, bg=CARD, bd=0, highlightthickness=0)   # (a plain frame: one native window)
         body.pack(fill="both", expand=True, padx=px(12), pady=(px(2), px(12)))
         body.columnconfigure(0, weight=1)
         return card, body
@@ -1570,14 +1861,46 @@ class App:
             e = self.entries[key]
             e.configure(border_color=CYAN if self.root.focus_get() is getattr(e, "_entry", None) else BORDER)
 
+    # Form captions are plain Tk labels: one native window each instead of a customtkinter label's
+    # three (frame, canvas, label). The input panel has dozens of them, and every native window is
+    # repainted on each scroll step, so this makes scrolling much lighter.
+    _BLANK = None
+
+    @staticmethod
+    def _bg_of(w):
+        """The colour a widget's children are drawn on (customtkinter frames may be transparent)."""
+        while w is not None:
+            try:
+                fg = w.cget("fg_color")
+            except (ValueError, tk.TclError, AttributeError):
+                fg = None
+            if fg not in (None, "transparent"):
+                return fg[1] if isinstance(fg, (tuple, list)) else fg
+            if fg is None:
+                try:
+                    return w.cget("bg")
+                except tk.TclError:
+                    pass
+            w = w.master
+        return CARD
+
+    def _plain_label(self, parent, text, size, color, width=0):
+        if App._BLANK is None:
+            App._BLANK = tk.PhotoImage(width=1, height=1)
+        # with an image, width and height are in pixels (the same box a customtkinter label has)
+        return tk.Label(parent, text=text, font=cfont(size), fg=color, bg=self._bg_of(parent), anchor="w",
+                        image=App._BLANK, compound="left", width=width or 0, height=px(28), bd=0, padx=0, pady=0,
+                        highlightthickness=0)
+
     def _label(self, parent, text, tip=""):
-        lab = ctk.CTkLabel(parent, text=text, font=font(13), text_color=TEXT2, anchor="w")
+        lab = self._plain_label(parent, text, 13, TEXT2)
         if tip:
             Tooltip(lab, tip)
         return lab
 
     def _unit(self, parent, text):
-        return ctk.CTkLabel(parent, text=text, font=font(11), text_color=MUTED, anchor="w", width=62)
+        # at least 62 px wide (so the entries line up), wider for a longer text
+        return self._plain_label(parent, text, 11, MUTED, width=max(px(62), cfont(11).measure(text) + px(4)))
 
     def _field(self, parent, row, label, key, unit="", tip=""):
         self._label(parent, label, tip).grid(row=row, column=0, sticky="w", pady=px(3))
@@ -1779,6 +2102,7 @@ class App:
         self._show_tab("dash")
 
     def _show_tab(self, key):
+        Tooltip.hide_all()
         for k, f in self.pages.items():
             if k == key:
                 f.grid()
@@ -1952,8 +2276,16 @@ class App:
             row=4, column=0, sticky="w", pady=px(3))
         self._unit(b, "blank = preset").grid(row=4, column=1, sticky="e", padx=px(8))
         self._entry(b, "cfd_iters").grid(row=4, column=2, sticky="e", pady=px(3))
+        self._label(b, "Air", "Air model of the 3D CFD. Compressible (rhoSimpleFoam): the density changes with "
+                    "pressure, as in real air - needed for fast props, where incompressible CFD underestimates the "
+                    "loads (by about 1/√(1-M²) at the blade's Mach number M). Incompressible (simpleFoam): faster "
+                    "and a little more robust, fine at low tip speeds. Auto: compressible above tip Mach "
+                    f"{getattr(cfd3d, 'COMPRESSIBLE_AUTO_MACH', 0.5):g}.").grid(row=5, column=0, sticky="w",
+                                                                              pady=px(3))
+        self._seg(b, "cfd_air", ["Auto", "Incompressible", "Compressible"]).grid(
+            row=5, column=1, columnspan=2, sticky="ew", pady=px(3), padx=(px(10), 0))
         btns = ctk.CTkFrame(b, fg_color="transparent")
-        btns.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(px(12), 0))
+        btns.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(px(12), 0))
         for c, wt in ((0, 4), (1, 5), (2, 3)):    # "Run OpenFOAM" needs the most room at the minimum window size
             btns.columnconfigure(c, weight=wt, uniform="cfdb")
         self.cfd_write_btn = self._button(btns, "Write case…", lambda: self._cfd_start(run=False))
@@ -1976,8 +2308,12 @@ class App:
         tbl.grid(row=0, column=0, sticky="ew")
         tbl.columnconfigure((1, 2, 3), weight=1, uniform="cmp")
         for c, t in enumerate(("", "BEMT", "3D CFD", "Δ")):
-            ctk.CTkLabel(tbl, text=spaced(t), font=font(10, "bold"), text_color=MUTED, anchor="e", height=18).grid(
-                row=0, column=c, sticky="e" if c else "w", padx=(0, px(4)))
+            hl = ctk.CTkLabel(tbl, text=spaced(t), font=font(10, "bold"), text_color=MUTED, anchor="e", height=18)
+            hl.grid(row=0, column=c, sticky="e" if c else "w", padx=(0, px(4)))
+            if c == 2:
+                self.cfd_col_hdr = hl
+                Tooltip(hl, "The CFD forces on the blades alone (outside the BEMT's hub cut-off), like the BEMT; "
+                            "the hub's own share is listed below the table.")
         self.cfd_cells = {}
         for r, (key, label, unit) in enumerate((("T", "Thrust", "N"), ("Q", "Torque", "N·m"), ("P", "Power", "W")), 1):
             ctk.CTkLabel(tbl, text=f"{label} [{unit}]", font=font(13), text_color=TEXT2, anchor="w").grid(
@@ -2276,6 +2612,10 @@ class App:
             a.append("--sweep")
         if self.show_geom.get():
             a.append("--show-geometry")
+        extra = getattr(self, "gen_model_extra", None)
+        if extra and not self.test_prop.get() and \
+                os.path.normcase(os.path.abspath(self.v["model"].get().strip().strip('"'))) == extra[0]:
+            a += extra[1]             # a generated prop with features: their aerodynamic effects
         return a
 
     @staticmethod
@@ -2681,12 +3021,13 @@ class App:
     def _op_text(out):
         r = out.res
         return (f"{out.name}  ·  {r.rpm:,.0f} rpm  ·  " + ("hover" if r.airspeed == 0 else f"{r.airspeed:g} m/s")
-                + f"  ·  ρ {out.args.rho:g}")
+                + f"  ·  ρ {out.args.rho:g}  ·  tip Mach {r.tip_mach:.2f}")
 
     def _cfd_source(self, out):
         """The BEMT run a case is made from; the tab describes it while the case runs or is shown."""
         r = out.res
-        self.cfd_out, self.cfd_desc, self.cfd_bemt = out, self._op_text(out), (r.thrust, r.torque, r.power)
+        self.cfd_out, self.cfd_desc, self.cfd_bemt = out, self._op_text(out), (r.thrust, r.torque, r.power,
+                                                                               r.stalled_fraction)
         self._cfd_update_op()
 
     def _cfd_update_op(self):
@@ -2710,6 +3051,7 @@ class App:
                     text += "\nInputs changed since the last run: the BEMT runs again first."
             bemt = (o.res.thrust, o.res.torque, o.res.power) if o is not None else None
         self.cfd_op.configure(text=text)
+        bemt = tuple(bemt[:3]) if bemt else bemt
         if not self.cfd_shown:      # until a CFD result is in, the table shows what the BEMT predicts
             for (k, fmt), v in zip((("T", "{:.2f}"), ("Q", "{:.4f}"), ("P", "{:.1f}")), bemt or (None,) * 3):
                 self.cfd_cells[k][0].configure(text=fmt.format(v) if v is not None else "—")
@@ -2718,6 +3060,7 @@ class App:
         iters = self._num("cfd_iters", "CFD iterations", int, lo=1)
         cores = self.v["cfd_cores"].get()
         return dict(resolution=self.v["cfd_res"].get(), n_procs=0 if cores == "Auto" else int(cores),
+                    air=self.v["cfd_air"].get().lower(),
                     iterations=iters or 0)
 
     def _cfd_start(self, run):
@@ -2795,7 +3138,7 @@ class App:
             if case_dir is None:
                 case_dir = self._case_dir_for(folder, out, settings["resolution"], replace)
                 st = cfd3d.CaseSettings(rpm=float(out.res.rpm), airspeed=float(out.args.airspeed),
-                                        rho=float(out.args.rho), **settings)
+                                        rho=float(out.args.rho), bemt=cfd3d.bemt_record(out, argv), **settings)
                 say(f"==> writing the case for {out.res.rpm:,.0f} rpm into {case_dir}")
                 info = cfd3d.write_case(case_dir, out.mesh, out.geom, st) or {}
                 self.cfd_info = info
@@ -2805,6 +3148,8 @@ class App:
                     lines.append(f"  {info.get('flavor', '?')} syntax, {info.get('resolution', '?')} mesh"
                                  + (f" (~{info['est_cells'] / 1e6:.2f} M cells)" if "est_cells" in info else "")
                                  + f", {info.get('n_procs', '?')} processes, {info.get('iterations', '?')} iterations")
+                    lines.append(f"  {info.get('air', 'incompressible')} air ({info.get('solver', '?')}), tip Mach "
+                                 f"{info.get('tip_mach', 0):.2f}")
                 lines += [f"  note: {n}" for n in info.get("notes", [])]
                 allrun = os.path.join(case_dir, "Allrun")
                 lines.append("  to run it on another machine with OpenFOAM:  bash Allrun" if os.name == "nt" else
@@ -2980,7 +3325,12 @@ class App:
     def _cfd_show_result(self, res, final):
         bemt = self.cfd_bemt
         self.cfd_shown = True
-        vals = (res.thrust, res.torque, res.power)
+        hub = getattr(res, "hub_thrust", None) is not None
+        # like for like: the BEMT covers the blades outside its hub cut-off, so the CFD column does too
+        bt, bq = (res.blade_thrust, res.blade_torque) if hub else (res.thrust, res.torque)
+        bp = res.power * bq / res.torque if abs(res.torque) > 1e-12 else 0.0
+        vals = (bt, bq, bp)
+        self.cfd_col_hdr.configure(text=spaced("CFD blades" if hub else "3D CFD"))
         for i, (k, fmt) in enumerate((("T", "{:.2f}"), ("Q", "{:.4f}"), ("P", "{:.1f}"))):
             b_, c_, d_ = self.cfd_cells[k]
             b_.configure(text=fmt.format(bemt[i]) if bemt else "—")
@@ -2993,7 +3343,12 @@ class App:
         conv = ("converged" if res.converged else "stopped" if final and self.cfd_stop.is_set()
                 else "not converged" if final else "running")
         self.cfd_res_hdr.set_right(f"{res.iterations} it · {conv}", GREEN if res.converged else AMBER)
-        self.cfd_msg.configure(text=res.message or "", text_color=TEXT2 if res.ok else RED)
+        notes = list(getattr(res, "notes", []))
+        if final and bemt and len(bemt) > 3 and bemt[3] > 0.25:
+            notes.append(f"{bemt[3] * 100:.0f} % of the span is stalled in the BEMT, whose 2D polars are pessimistic "
+                         "there (rotation delays stall): the CFD is the better estimate")
+        self.cfd_msg.configure(text="\n".join([res.message or ""] + [f"• {n}" for n in notes]),
+                               text_color=TEXT2 if res.ok else RED)
         if len(res.history) == 1:
             it = res.history[0][0]
             self.hist_chart.set_data(None, empty=f"One force sample so far (iteration {it}); "
@@ -3003,6 +3358,9 @@ class App:
             dots = len(h) <= 40
             # zoom on the last 70 % of the iterations: the first samples are far off and would flatten the rest
             yfrom = h[-1, 0] * 0.3 if np.count_nonzero(h[:, 0] >= h[-1, 0] * 0.3) >= 2 else None
+            if hub:         # the hub share as averaged (a constant offset over the history)
+                h[:, 1] -= res.hub_thrust
+                h[:, 2] -= res.hub_torque
             if bemt and abs(bemt[0]) > 1e-12 and abs(bemt[1]) > 1e-12:
                 # both as % off the BEMT on one axis: the table's delta column over the iterations, and no
                 # two co-rising curves drawn on top of each other (thrust, the key one, is drawn last)
@@ -3080,16 +3438,72 @@ class App:
         if not d:
             return
 
+        base = self._cfd_aero_argv()
+
         def work():
             try:
-                self._post(self._cfd_loaded, cfd3d.read_results(d), d, "")
+                bemt, how = self._cfd_case_bemt(d, base)
+                res = cfd3d.read_results(d, hub_radius=bemt[4] if bemt and bemt[4] else None)
+                self._post(self._cfd_loaded, res, d, "", bemt, how)
             except NotImplementedError:
                 self._post(self._cfd_loaded, None, d, "Reading CFD results is not implemented in this build.")
             except Exception as e:  # noqa: BLE001
                 self._post(self._cfd_loaded, None, d, f"{type(e).__name__}: {e}")
         threading.Thread(target=work, daemon=True).start()
 
-    def _cfd_loaded(self, res, d, err):
+    def _cfd_aero_argv(self):
+        """The aerodynamic model settings of the form (not the model, speed or flight condition), for
+        re-running the BEMT of a loaded case (Tk thread)."""
+        out = []
+        for key, flag, label in (("hub", "--hub-ratio", "Hub cut-off r/R"), ("clmax", "--cl-max", "Cl max"),
+                                 ("clalpha", "--cl-alpha", "Lift slope"), ("cd0", "--cd0", "Cd0")):
+            try:
+                x = self._num(key, label, lo=0)
+            except InputError:
+                x = None
+            if x is not None:
+                out += [flag, repr(x)]
+        polar = self.v["polar"].get().strip().strip('"')
+        if polar and os.path.isfile(polar):
+            out += ["--polar", polar]
+        if self.v["aero"].get() == "neuralfoil":
+            out += ["--aero", "neuralfoil", "--nf-model", self.v["nf_model"].get()]
+        return out
+
+    def _cfd_case_bemt(self, d, base):
+        """(thrust, torque, power, stalled fraction, hub radius) of the BEMT for a case folder, and how
+        it was found: stored with the case when PropSim wrote it, else run now on the case's own model
+        (constant/triSurface/prop.stl, in metres along +z) at its rpm, airspeed and air density (worker)."""
+        try:
+            with open(os.path.join(d, cfd3d.CASE_INFO)) as f:
+                info = json.load(f)
+        except (OSError, ValueError):
+            return None, "no propsim_case.json in the folder: compared with the dashboard's BEMT run"
+        b = info.get("bemt")
+        if b:
+            return (b["thrust"], b["torque"], b["power"], b.get("stalled_fraction", 0.0),
+                    b.get("hub_radius", info.get("hub_radius", 0.0))), "the BEMT stored with the case"
+        stl = os.path.join(d, "constant", "triSurface", "prop.stl")
+        if not os.path.isfile(stl):
+            return None, "the case has no constant/triSurface/prop.stl: compared with the dashboard's BEMT run"
+        argv = [stl, "--units", "m", "--axis", "z", "--rpm", repr(float(info["rpm"])),
+                "--airspeed", repr(float(info.get("airspeed", 0.0))), "--rho", repr(float(info.get("rho", 1.225)))]
+        if info.get("blades"):
+            argv += ["--blades", str(int(info["blades"]))]
+        argv += base
+        self._post(self.status.set, "3D CFD: running the BEMT for the loaded case's own model…", "busy")
+        try:
+            out = self._simulate(argv, lambda m: self._post(self.status.set, "3D CFD: " + m, "busy"))
+        except Exception as e:  # noqa: BLE001 - fall back to the dashboard's run, and say why
+            traceback.print_exc()
+            return None, f"the BEMT could not be run on the case's model ({self._describe(e)}): compared with the " \
+                         "dashboard's BEMT run"
+        r = out.res
+        return ((r.thrust, r.torque, r.power, r.stalled_fraction, float(out.geom.hub_radius)),
+                "the BEMT re-run now on the case's own model and conditions (current aerodynamic settings; "
+                "features such as serrations are not known to an older case)")
+
+    def _cfd_loaded(self, res, d, err, bemt=None, how=""):
         if err or res is None:
             self._show_banner(err or "No results found.", "3D CFD", RED)
             return
@@ -3097,14 +3511,20 @@ class App:
         self.cfd_stop.clear()         # a stop of an earlier run says nothing about these results
         self._cfd_buttons()
         o = self.outcome
-        self.cfd_out = o
-        self.cfd_bemt = (o.res.thrust, o.res.torque, o.res.power) if o is not None else None
-        self.cfd_desc = f"Loaded case: {os.path.basename(os.path.abspath(d))}" + (
-            f"  ·  {res.rpm:,.0f} rpm" if res.rpm else "")
+        own = bemt is not None
+        self.cfd_out = None if own else o
+        if own:
+            self.cfd_bemt = bemt[:4]
+        else:
+            self.cfd_bemt = (o.res.thrust, o.res.torque, o.res.power, o.res.stalled_fraction) if o is not None else None
+        self.cfd_desc = (f"Loaded case: {os.path.basename(os.path.abspath(d))}"
+                         + (f"  ·  {res.rpm:,.0f} rpm" if res.rpm else "") + f"\nBEMT column: {how}")
         self._cfd_show_result(res, True)
         self._cfd_update_op()
-        self._cfd_log_lines([f"==> results of {d}: {res.message}"], "app" if res.ok else "err")
-        if self.outcome is not None and res.rpm and abs(res.rpm - self.outcome.res.rpm) > 1:
+        self._cfd_log_lines([f"==> results of {d}: {res.message}", f"    BEMT: {how}"]
+                            + [f"    note: {n}" for n in res.notes], "app" if res.ok else "err")
+        self.status.set(f"Loaded CFD case {os.path.basename(os.path.abspath(d))}", "ok")
+        if not own and self.outcome is not None and res.rpm and abs(res.rpm - self.outcome.res.rpm) > 1:
             self._show_banner(f"The case ran at {res.rpm:,.0f} rpm but the last BEMT run is at "
                               f"{self.outcome.res.rpm:,.0f} rpm, so the comparison is not like for like.",
                               "NOTE", AMBER)
@@ -3134,10 +3554,19 @@ class App:
         self.gen_airfoils = ({v["label"]: k for k, v in propgen.AIRFOILS.items()} if propgen
                              else {"Clark-Y": "clarky"})
         for k, val in dict(gen_goal="Max thrust", gen_src="Motor (left panel)", gen_target="", gen_rpm="",
-                           gen_pshaft="", gen_blades="2", gen_cw="Printed (solid)", gen_dens="1.24",
+                           gen_pshaft="", gen_blades="2", gen_cw="Solid (prop material)", gen_dens="1.24",
+                           gen_sup="Generic", gen_mat="PLA", gen_proc="FDM 3D print", gen_uts="60", gen_mod="3.5", gen_sf="2",
+                           gen_alt="30", gen_pitch="", gen_pmode="At 75 % R",
+                           gen_sweep="", gen_sweep0="0.35", gen_serr="", gen_serr_w="15", gen_serr_span="0.5-0.95",
+                           gen_tub="", gen_tub_w="30", gen_tub_span="0.3-0.9", gen_tip="None",
+                           gen_wl_h="6", gen_wl_cant="80", gen_wl_dir="Up", gen_rake="45", gen_rake_len="12",
                            gen_dmax="254", gen_dfix="", gen_mach="0.6",
                            gen_airfoil=next(iter(self.gen_airfoils)), gen_spin="CCW", gen_bore="5",
-                           gen_hub="").items():
+                           gen_hub="", gen_hub_h="", gen_edge="Sharp", gen_edge_mm="1", gen_spinner="None",
+                           gen_spinner_len="", gen_pocket="", gen_tol="0", gen_dflat="", gen_setscrew="",
+                           gen_hex="", gen_hex_d="3", gen_holes="", gen_hole_d="3.2", gen_pcd="16",
+                           gen_head="None", gen_head_d="6", gen_head_dep="3", gen_fillet="", gen_offset="0",
+                           gen_step="Exact").items():
             self.v[k] = tk.StringVar(value=val)
         page.columnconfigure(0, weight=0)
         page.columnconfigure(1, weight=1)
@@ -3155,8 +3584,8 @@ class App:
         card.columnconfigure(0, weight=1)
         hdr = CardHeader(card, "Design brief", "A", accent=GREEN)
         hdr.grid(row=0, column=0, sticky="ew", padx=px(3), pady=(px(3), 0))
-        sc = ctk.CTkScrollableFrame(card, fg_color=CARD, corner_radius=0, scrollbar_button_color=BORDER,
-                                    scrollbar_button_hover_color=BORDER2)
+        self.gen_sc = sc = ctk.CTkScrollableFrame(card, fg_color=CARD, corner_radius=0, scrollbar_button_color=BORDER,
+                                                  scrollbar_button_hover_color=BORDER2)
         sc.grid(row=1, column=0, sticky="nsew", padx=(px(8), px(2)))
         b = ctk.CTkFrame(sc, fg_color="transparent")
         b.pack(fill="both", expand=True, padx=(px(4), px(6)))
@@ -3182,28 +3611,54 @@ class App:
         self.gen_src_info.grid(row=r, column=0, columnspan=3, sticky="w", pady=(0, px(4)))
         r += 1
         self.gen_rows = {}
+
+        def row(key, label, unit, tip, rr):
+            lab = self._label(b, label, tip)
+            lab.grid(row=rr, column=0, sticky="w", pady=px(3))
+            prev = self.entries.get(key)
+            e = self._entry(b, key, width=88)
+            if prev is not None:          # a second view of a left-panel field: errors still point there
+                self.entries[key] = prev
+            e.grid(row=rr, column=1, sticky="e", pady=px(3))
+            u = self._unit(b, unit)
+            u.grid(row=rr, column=2, sticky="w", padx=(px(8), 0))
+            self.gen_rows[key] = (lab, e, u)
+            return lab, e, u
+
         for key, label, unit, tip in (
                 ("gen_target", "Target thrust", "N", "Thrust the prop must make (Target thrust goal)."),
                 ("gen_rpm", "Speed", "rpm", "Shaft speed. Blank = PropSim picks the best speed under the tip "
                  "Mach limit."),
                 ("gen_pshaft", "Shaft power", "W", "Power available at the shaft."),
-                ("gen_dmax", "Max diameter", "mm", "Largest prop that fits (frame, ground clearance)."),
+                ("gen_dmax", "Max diameter", "mm", "Largest prop that fits (frame, ground clearance). With "
+                 "winglets this is the overall diameter, winglets included."),
                 ("gen_dfix", "Fixed diameter", "mm · auto", "Blank = PropSim picks the best diameter up to the "
                  "max."),
+                ("gen_pitch", "Pitch", "mm · auto", "Blank = the optimum blade angles. Or set the pitch you want, "
+                 "in mm or with 'in' (e.g. 6in or 6\"): the blade is twisted to it and the chord adapts so the "
+                 "power is still absorbed. The report says what it costs against the optimum.")):
+            row(key, label, unit, tip, r)
+            r += 1
+        self._label(b, "Pitch mode", "At 75 % R: the set pitch is the pitch at 75 % of the radius (how props are "
+                    "labelled), with the optimum twist shape along the blade. Constant: the same geometric "
+                    "pitch from root to tip (a helical blade, like many simple props).").grid(
+            row=r, column=0, sticky="w", pady=px(3))
+        self._seg(b, "gen_pmode", ["At 75 % R", "Constant"]).grid(row=r, column=1, columnspan=2, sticky="ew",
+                                                                  pady=px(3))
+        r += 1
+        for key, label, unit, tip in (
                 ("gen_mach", "Max tip Mach", "", "Helical tip speed limit as a Mach number, up to "
                  f"{propgen.MAX_TIP_MACH if propgen else 0.98:g}. 0.6 keeps noise and compressibility losses "
                  "low. Above about 0.75 the tips go transonic: PropSim thins them and adds wave drag (an "
                  "engineering estimate). Above 1 the tips are supersonic: experimental, extremely loud; use "
-                 "the Experimental (high speed) airfoils."),
+                 "the Experimental (high speed) airfoils. Blade sweep (below) delays the transonic drag rise."),
                 ("gen_bore", "Shaft bore", "mm", "Hole through the hub for the motor shaft or prop adapter."),
-                ("gen_hub", "Hub diameter", "mm · auto", "Blank = sized from the bore and the diameter.")):
-            lab = self._label(b, label, tip)
-            lab.grid(row=r, column=0, sticky="w", pady=px(3))
-            e = self._entry(b, key, width=88)
-            e.grid(row=r, column=1, sticky="e", pady=px(3))
-            u = self._unit(b, unit)
-            u.grid(row=r, column=2, sticky="w", padx=(px(8), 0))
-            self.gen_rows[key] = (lab, e, u)
+                ("gen_hub", "Hub diameter", "mm · auto", "Blank = sized from the bore and the diameter."),
+                ("airspeed", "Airspeed", "m/s", "Design airspeed (forward flight); 0 = static thrust (hover). "
+                 "The same setting as card 04 on the left: changing one changes both."),
+                ("rho", "Air density", "kg/m³", "1.225 at sea level, ~1.11 at 1000 m, ~1.0 at 2000 m. The same "
+                 "setting as card 04 on the left.")):
+            row(key, label, unit, tip, r)
             r += 1
         self._label(b, "Blades", "1 = a single blade balanced by a counterweight opposite it: the least "
                     "blade interference and tip loss for its blade area, used on some gliders and record "
@@ -3214,23 +3669,16 @@ class App:
         r += 1
         # single blade: the counterweight (shown only for 1 blade)
         cw_lab = self._label(b, "Counterweight", "Balances the single blade, statically and dynamically "
-                             "(its centre of mass sits opposite the blade's). Printed: a solid printed pod. A "
-                             "metal rod insert keeps the pod small: a hole is left for a standard rod that you cut "
-                             "to the length shown, then glue in.")
+                             "(its centre of mass sits opposite the blade's). Solid: a pod of the prop's own "
+                             "material (moulded, machined or printed with it). A metal rod insert keeps the pod "
+                             "small: a hole is left for a standard rod cut to the length shown, then pressed in, "
+                             "bonded or moulded in.")
         cw_opt = self._option(b, "gen_cw", list(self.GEN_CW), width=150)
-        dens_lab = self._label(b, "Print density", "Density of the printing material, used to size the "
-                               "counterweight: PLA 1.24, PETG 1.27, ABS 1.05, ASA 1.07, nylon 1.14 g/cm³. Print "
-                               "the prop at 100 % infill so the balance works.")
-        dens_e = self._entry(b, "gen_dens", width=88)
-        dens_u = self._unit(b, "g/cm³")
         cw_lab.grid(row=r, column=0, sticky="w", pady=px(3))
         cw_opt.grid(row=r, column=1, columnspan=2, sticky="e", pady=px(3))
-        dens_lab.grid(row=r + 1, column=0, sticky="w", pady=px(3))
-        dens_e.grid(row=r + 1, column=1, sticky="e", pady=px(3))
-        dens_u.grid(row=r + 1, column=2, sticky="w", padx=(px(8), 0))
-        self.gen_cw_widgets = (cw_lab, cw_opt, dens_lab, dens_e, dens_u)
+        self.gen_cw_widgets = (cw_lab, cw_opt)
         self._gen_cw_rows()
-        r += 2
+        r += 1
         self._label(b, "Airfoil", "Section shape; it gets thicker toward the root for strength.").grid(
             row=r, column=0, sticky="w", pady=px(3))
         self._option(b, "gen_airfoil", list(self.gen_airfoils), width=150).grid(
@@ -3246,7 +3694,192 @@ class App:
                     "motors' 'normal' props are CCW.").grid(row=r, column=0, sticky="w", pady=px(3))
         self._seg(b, "gen_spin", ["CCW", "CW"]).grid(row=r, column=1, columnspan=2, sticky="ew", pady=px(3))
         r += 1
-        ctk.CTkLabel(b, text="Airspeed, air density and the aerodynamics choice come from the left panel.",
+        # ---- hub
+        ctk.CTkLabel(b, text="HUB", font=font(11, "bold"), text_color=CYAN, anchor="w").grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(px(10), px(2)))
+        r += 1
+        self.gen_hub_widgets = {}
+
+        def hrow(key, label, unit, tip, group=None):
+            nonlocal r
+            w_ = row(key, label, unit, tip, r)
+            if group:
+                self.gen_hub_widgets.setdefault(group, []).extend(w_)
+            r += 1
+
+        def hseg(key, label, values, tip, group=None):
+            nonlocal r
+            lab = self._label(b, label, tip)
+            lab.grid(row=r, column=0, sticky="w", pady=px(3))
+            sg = self._seg(b, key, values, command=lambda _v: self._gen_hub_rows())
+            sg.grid(row=r, column=1, columnspan=2, sticky="ew", pady=px(3))
+            if group:
+                self.gen_hub_widgets.setdefault(group, []).extend([lab, sg])
+            r += 1
+
+        hrow("gen_hub_h", "Hub height", "mm · auto", "Blank = sized from the diameter (and grown for the root "
+             "fillet, the blade offset and the edges, or for strength).")
+        hseg("gen_edge", "Hub edges", ["Sharp", "Chamfer", "Round"], "The hub's outer top and bottom edges: "
+             "sharp, chamfered or rounded.")
+        hrow("gen_edge_mm", "Edge size", "mm", "Chamfer size or edge radius.", "edge")
+        hseg("gen_spinner", "Spinner", ["None", "Cone", "Dome", "Ogive"], "A streamlined nose on the front "
+             "(thrust side) of the hub. In fast forward flight it removes most of the bare hub's drag (the 3D CFD "
+             "shows it). Without a pocket the bore ends under it.")
+        hrow("gen_spinner_len", "Spinner length", "mm · auto", "Blank = from the hub size (dome 1, cone 1.6, "
+             "ogive 2 hub radii).", "spinner")
+        hrow("gen_pocket", "Spinner pocket", "mm · none", "Diameter of a pocket inside the spinner for the end "
+             "of the shaft or a prop nut (the bore then continues into it).", "spinner")
+        hrow("gen_tol", "Bore tolerance", "mm", "Added to the shaft bore: + for a clearance fit (FDM holes "
+             "print about 0.1-0.3 mm small), - for a press fit.")
+        hrow("gen_dflat", "D-flat", "mm · none", "Depth of a flat on the bore for a D-shaft (0.5 on a 5 mm "
+             "shaft is common). It faces the set screw.")
+        hrow("gen_setscrew", "Set screw", "mm · none", "Diameter of a radial hole at mid-height, between two "
+             "blades, for a set screw (tap drill size, e.g. 2.5 for M3).")
+        hrow("gen_hex", "Nut pocket", "mm AF · none", "Hex pocket in the front face for a prop nut, across "
+             "flats (e.g. 8 for an M5 nut).")
+        hrow("gen_hex_d", "Pocket depth", "mm", "Depth of the hex pocket.", "hex")
+        hrow("gen_holes", "Mount holes", "· none", "Number of mounting holes on a bolt circle (e.g. 4 for "
+             "motors with a threaded bell and no shaft). With a spinner they go on through it, wide enough "
+             "for the screw heads.")
+        hrow("gen_hole_d", "Hole size", "mm", "Hole diameter (3.2 = M3 clearance, 2.2 = M2).", "holes")
+        hrow("gen_pcd", "Bolt circle", "mm", "Diameter of the circle through the hole centres (motors: 12, 16, "
+             "19 mm are common).", "holes")
+        hseg("gen_head", "Screw heads", ["None", "Countersink", "Counterbore"], "A recess on the front for "
+             "the screw heads.", "holes")
+        hrow("gen_head_d", "Head size", "mm", "Diameter of the head recess.", "head")
+        hrow("gen_head_dep", "Head depth", "mm", "Depth of the counterbore.", "cbore")
+        hrow("gen_fillet", "Root fillet", "mm · none", "A rounded fillet where each blade meets the hub: "
+             "less stress concentration at the root and a stronger, cleaner print.")
+        hrow("gen_offset", "Blade offset", "mm", "Moves the blades along the axis: + towards the thrust side "
+             "(front), - towards the motor.")
+        self.v["gen_holes"].trace_add("write", lambda *_: self._gen_hub_rows())
+        self.v["gen_hex"].trace_add("write", lambda *_: self._gen_hub_rows())
+        self._gen_hub_rows()
+        hseg("gen_step", "STEP surface", ["Exact", "Smooth"], "Exact: every blade is a B-spline surface "
+             "through every point of the STL's surface, so the STEP keeps all its details (tubercles, teeth, "
+             "winglets). Smooth: the same from a coarser grid, a lighter file with slightly smoother surfaces. "
+             "Both are one closed solid.")
+        # ---- material, manufacturing, strength
+        ctk.CTkLabel(b, text="MATERIAL & STRENGTH", font=font(11, "bold"), text_color=GREEN, anchor="w").grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(px(10), px(2)))
+        r += 1
+        self._label(b, "Supplier", "Whose catalogue to pick from. Generic: typical grades of the common "
+                    "materials. JLC3DP: its SLA resins, MJF / SLS nylons, FDM plastics, full-colour WJP resin and "
+                    "SLM / binder-jet metals. PCBWay: its resins, nylons, FDM plastics, SLM metals and the CNC "
+                    "metals and plastics. SendCutSend: its laser / waterjet / router-cut sheets (flat parts "
+                    "only) and CNC-machined 6061. The Process and Material lists then show only what that "
+                    "supplier offers (for Generic, the materials usually made by the chosen process). Values are the suppliers' published data where they give them, otherwise "
+                    "typical values for the grade: check the datasheet for anything critical.").grid(
+            row=r, column=0, sticky="w", pady=px(3))
+        self._option(b, "gen_sup", list(propgen.structure.SUPPLIER_NAMES) if propgen else ["Generic"],
+                     width=150).grid(row=r, column=1, columnspan=2, sticky="e", pady=px(3))
+        r += 1
+        self._label(b, "Process", "How it is made. Each process scales the material's strength and fatigue "
+                    "strength: FDM printing about 0.65 (printed flat, 100 % infill), resin and powder-bed "
+                    "printing 0.9, material jetting (WJP / PolyJet) 0.85, injection moulding 0.9 (knit lines, "
+                    "voids), CNC machining 1.0, composite layup 0.9, metal printing (SLM/DMLS) 0.95 with about "
+                    "half the fatigue strength as built (porosity, rough surface), metal binder jet 0.9 with half "
+                    "the fatigue strength. Sheet cutting (laser, waterjet, router) makes flat parts only: a "
+                    "twisted blade cannot be cut from sheet.").grid(row=r, column=0, sticky="w", pady=px(3))
+        self.gen_proc_menu = self._option(b, "gen_proc", list(propgen.PROCESSES) if propgen else ["FDM 3D print"],
+                                          width=150)
+        self.gen_proc_menu.grid(row=r, column=1, columnspan=2, sticky="e", pady=px(3))
+        r += 1
+        self._label(b, "Material", "What the prop is made of: sets the density (centrifugal load, counterweight) "
+                    "and the strength the blade is checked against. Generic: printing plastics, "
+                    "injection-moulding nylons (plain, glass or carbon filled), POM, PC, PEEK, resin, composites, "
+                    "wood and boards, aluminium, titanium, steels, stainless, tool steels, brass, copper. "
+                    "Pick a Supplier to see its own grades (for example JLC3DP PA12-HP or PCBWay Somos Taurus). "
+                    "Rubbers, foams and gasket sheets are listed because the sheet suppliers cut them, but they "
+                    "are not blade materials. Edit density, strength or modulus for your exact grade (the "
+                    "material then shows Custom).").grid(row=r, column=0, sticky="w", pady=px(3))
+        self.gen_mat_menu = self._option(b, "gen_mat", list(self.GEN_MATERIALS) + ["Custom"], width=150)
+        self.gen_mat_menu.grid(row=r, column=1, columnspan=2, sticky="e", pady=px(3))
+        r += 1
+        for key, label, unit, tip in (
+                ("gen_dens", "Density", "g/cm³", "Density of the prop material. The counterweight balance assumes a "
+                 "fully solid part: if you 3D print it, use 100 % infill."),
+                ("gen_uts", "Strength", "MPa", "Tensile strength of the moulded / bulk material (the process "
+                 "factor is applied on top)."),
+                ("gen_mod", "Modulus", "GPa", "Young's modulus: sets how far the blade bends and twists, and the "
+                 "centrifugal relief of the bending."),
+                ("gen_sf", "Safety factor", "", "Design safety factor on the strength (static and fatigue). 2 is "
+                 "a sensible minimum for model props; use 3+ for big, fast or people-carrying props, or "
+                 "untested materials."),
+                ("gen_alt", "Vibration load", "%", "Alternating load for the fatigue check, as a percentage of the "
+                 "aerodynamic bending: 30 for a prop in axial flow; more for edgewise / forward flight on a "
+                 "multirotor, gusts or a vibrating mount. 0 = static check only.")):
+            row(key, label, unit, tip, r)
+            r += 1
+        self.gen_respect = tk.BooleanVar(value=True)
+        sw = self._switch(b, "Design within strength limits", self.gen_respect)
+        sw.grid(row=r, column=0, columnspan=3, sticky="w", pady=(px(4), px(2)))
+        Tooltip(sw, "On: under-strength sections are thickened (up to 30 % t/c on the blade, 55 % at the root), "
+                    "the hub grows if the root needs it, and if that is still not enough a slower or smaller prop "
+                    "is chosen. Off: the blade is designed for aerodynamics only and the stresses are just "
+                    "reported.")
+        r += 1
+        self.v["gen_mat"].trace_add("write", lambda *_: self._gen_material())
+        self.v["gen_sup"].trace_add("write", lambda *_: self._gen_supplier())
+        self.v["gen_proc"].trace_add("write", lambda *_: self._gen_process())
+        self._gen_supplier()
+        for k_ in ("gen_dens", "gen_uts", "gen_mod"):
+            self.v[k_].trace_add("write", lambda *_: self._gen_density_typed())
+        # ---- experimental blade features
+        ctk.CTkLabel(b, text="EXPERIMENTAL FEATURES", font=font(11, "bold"), text_color=AMBER, anchor="w").grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(px(10), px(2)))
+        r += 1
+        for key, label, unit, tip in (
+                ("gen_sweep", "Sweep", "° · off", "Scimitar blade: the blade curves back (against the rotation), "
+                 "growing to this sweep angle at the tip. It lowers the Mach number the sections see, so it "
+                 "delays the transonic drag rise of fast tips (simple sweep theory). It also lowers the lift "
+                 "slope, and swept blades bend and twist more under load. Negative = forward sweep. Blank = none."),
+                ("gen_sweep0", "Sweep from", "r/R", "Where the sweep begins (0.35 = 35 % of the radius)."),
+                ("gen_serr", "Serrations", "% c · off", "Serrated (sawtooth) trailing edge: tooth depth as a "
+                 "percentage of the local chord (10-25 is typical). Mainly a noise feature: up to several dB less "
+                 "trailing-edge noise; no high-speed benefit, a little more drag (the blade is widened to keep "
+                 "its lift). Blank = none."),
+                ("gen_serr_w", "Tooth width", "% c", "Spanwise width of one tooth, as a percentage of the local "
+                 "chord. Narrow, deep teeth (width about the depth or less) reduce noise most."),
+                ("gen_serr_span", "Teeth span", "r/R", "Where the teeth run, as from-to fractions of the radius, "
+                 "e.g. 0.5-0.95."),
+                ("gen_tub", "Tubercles", "% c · off", "Leading-edge tubercles (humpback-whale bumps): amplitude as "
+                 "a percentage of the local chord (2-8 is typical). They make stall gentle, which helps a prop "
+                 "working at high angles of attack (e.g. a fast prop at static thrust); a little more drag at "
+                 "the design point. Blank = none."),
+                ("gen_tub_w", "Wavelength", "% c", "Spacing of the tubercles as a percentage of the local chord "
+                 "(25-50 is typical)."),
+                ("gen_tub_span", "Tubercle span", "r/R", "Where the tubercles run, e.g. 0.3-0.9.")):
+            row(key, label, unit, tip, r)
+            r += 1
+        self._label(b, "Tip", "Winglet: the blade tip turns up (towards the thrust side) or down; it reduces "
+                    "the tip loss a little but adds its own drag (within a fixed overall diameter a plain "
+                    "longer blade usually does as well). Raked tip: the outer blade sweeps back strongly; "
+                    "modelled as sweep.").grid(row=r, column=0, sticky="w", pady=px(3))
+        self._seg(b, "gen_tip", ["None", "Winglet", "Raked"], command=lambda _v: self._gen_tip_rows()).grid(
+            row=r, column=1, columnspan=2, sticky="ew", pady=px(3))
+        r += 1
+        self.gen_tip_widgets = {"Winglet": [], "Raked": []}
+        for key, label, unit, tip, kind in (
+                ("gen_wl_h", "Winglet length", "% R", "Length of the winglet along its span, as a percentage "
+                 "of the tip radius (4-10 is typical).", "Winglet"),
+                ("gen_wl_cant", "Winglet cant", "°", "Angle between the winglet and the blade: 90 = at right "
+                 "angles, smaller = leaning outwards.", "Winglet"),
+                ("gen_rake", "Rake angle", "°", "Extra sweep of the raked tip.", "Raked"),
+                ("gen_rake_len", "Rake length", "% R", "Length of the raked part, as a percentage of the radius.",
+                 "Raked")):
+            self.gen_tip_widgets[kind].extend(row(key, label, unit, tip, r))
+            r += 1
+        wl_lab = self._label(b, "Winglet side", "Up: towards the thrust side (+Z, the blade's suction side). "
+                             "Down: towards the motor.")
+        wl_lab.grid(row=r, column=0, sticky="w", pady=px(3))
+        wl_seg = self._seg(b, "gen_wl_dir", ["Up", "Down"])
+        wl_seg.grid(row=r, column=1, columnspan=2, sticky="ew", pady=px(3))
+        self.gen_tip_widgets["Winglet"] += [wl_lab, wl_seg]
+        r += 1
+        self._gen_tip_rows()
+        ctk.CTkLabel(b, text="Features are built into the model and their effect is a rough engineering estimate "
+                     "(see the notes after Generate). The aerodynamics choice comes from card 03 on the left.",
                      font=font(11), text_color=MUTED, anchor="w", justify="left", wraplength=290).grid(
             row=r, column=0, columnspan=3, sticky="w", pady=(px(6), 0))
         foot = ctk.CTkFrame(card, fg_color="transparent")
@@ -3280,8 +3913,8 @@ class App:
             tiles.columnconfigure(c, weight=1, uniform="gtiles")
         self.gen_tiles = {}
         for key, label, rr, c, span, col, hero in (
-                ("size", "Propeller", 0, 0, 2, GREEN, True), ("rpm", "Speed", 0, 2, 1, CYAN, False),
-                ("check", "Model check", 0, 3, 1, GREEN, False),
+                ("size", "Propeller", 0, 0, 1, GREEN, False), ("rpm", "Speed", 0, 1, 1, CYAN, False),
+                ("strength", "Strength", 0, 2, 1, AMBER, False), ("check", "Model check", 0, 3, 1, GREEN, False),
                 ("thrust", "Thrust", 1, 0, 1, CYAN, False), ("power", "Shaft power", 1, 1, 1, MAGENTA, False),
                 ("eff", "Figure of merit", 1, 2, 1, GREEN, False), ("batt", "Battery", 1, 3, 1, VIOLET, False)):
             t = KpiTile(tiles, label, col, hero)
@@ -3298,10 +3931,26 @@ class App:
         self.gen_shape = LineChart(lower, "Blade shape", "r / R", ("chord [mm]", "c [mm]"),
                                    ("blade angle [°]", "β [°]"), empty="Generate a propeller to see its blade")
         self.gen_shape.grid(row=0, column=1, sticky="nsew", padx=(px(6), px(4)), pady=px(4))
-        self.gen_scan = LineChart(lower, "Diameter scan", "diameter [mm]", ("thrust [N]", "T [N]"),
+        scan_box = tk.Frame(lower, bg=BG)
+        scan_box.grid(row=1, column=1, sticky="nsew", padx=(px(6), px(4)), pady=px(4))
+        scan_box.columnconfigure(0, weight=1)
+        scan_box.rowconfigure(1, weight=1)
+        self.gen_chart_kind = tk.StringVar(value="Diameter scan")
+        seg = ctk.CTkSegmentedButton(
+            scan_box, values=["Diameter scan", "Vibration"], variable=self.gen_chart_kind,
+            command=lambda _v: self._gen_chart(), height=24, font=font(11, "bold"), fg_color=INPUT,
+            selected_color=CYAN_D, selected_hover_color="#0ba7c7", unselected_color=INPUT,
+            unselected_hover_color=CARD2, text_color=TEXT, text_color_disabled=MUTED, corner_radius=7)
+        seg.grid(row=0, column=0, sticky="e", pady=(0, px(3)))
+        for btn in getattr(seg, "_buttons_dict", {}).values():     # the segmented button itself takes no bindings
+            Tooltip(btn, "Diameter scan: the diameters the generator tried. Vibration (Campbell diagram): the "
+                         "blade's natural frequencies against rotation speed, with the 1P-4P excitation lines; "
+                         "where a mode line crosses an excitation line at the operating speed the blade resonates.")
+        self.gen_scan = LineChart(scan_box, "Diameter scan", "diameter [mm]", ("thrust [N]", "T [N]"),
                                   ("efficiency", "η"), empty="The diameters tried appear here",
                                   xfmt=lambda v, s: f"{v:,.0f}")
-        self.gen_scan.grid(row=1, column=1, sticky="nsew", padx=(px(6), px(4)), pady=px(4))
+        self.gen_scan.grid(row=1, column=0, sticky="nsew")
+        self._gen_chart_d = None
         self.gen_text = ctk.CTkTextbox(lower, font=font(11, mono=True), wrap="none", fg_color=CARD, text_color=TEXT2,
                                        border_width=1, border_color=BORDER, corner_radius=12,
                                        scrollbar_button_color=BORDER, scrollbar_button_hover_color=BORDER2)
@@ -3311,7 +3960,7 @@ class App:
         self._gen_set_text([("Design a propeller for your setup:\nset the goal and limits, then press "
                              "Generate.\n\nPropSim works out the best blade\n(minimum induced loss, each section "
                              "at its\nbest lift-to-drag), then checks it by slicing\nthe generated 3D model and "
-                             "analysing it\nlike any other prop. Export it as STL or\nSTEP for printing or CAD.", None)])
+                             "analysing it\nlike any other prop. Export it as STL or\nSTEP for manufacturing or CAD.", None)])
         if propgen is None:
             self._gen_set_text([(f"The propeller generator could not be loaded ({GEN_IMPORT_ERROR}).", "warn")])
         self.gen_strip.set_empty("No design yet")
@@ -3356,7 +4005,139 @@ class App:
             v = 0.0
         self.gen_src_info.configure(text=txt + ("  ·  static (hover)" if v == 0 else f"  ·  designed for {v:g} m/s"))
 
-    GEN_CW = {"Printed (solid)": "printed", "Steel rod insert": "steel", "Brass rod insert": "brass",
+    GEN_MATERIALS = dict(propgen.MATERIALS) if propgen else {"PLA": 1.24}
+
+    def _gen_mat_values(self, m):
+        import structure as st_mod
+        v = st_mod.MATERIAL_DB[m]
+        return {"gen_dens": f"{v[0]:g}", "gen_uts": f"{v[2]:g}", "gen_mod": f"{v[1]:g}"}
+
+    def _gen_material(self):
+        m = self.v["gen_mat"].get()
+        if m in self.GEN_MATERIALS:
+            self._setting_density = True
+            for k, val in self._gen_mat_values(m).items():
+                self.v[k].set(val)
+            self._setting_density = False
+            import structure as st_mod
+            procs = st_mod.MATERIAL_DB[m][5]
+            sup = self.v["gen_sup"].get() if "gen_sup" in self.v else "Generic"
+            if sup in st_mod.SUPPLIERS:
+                procs = [p for p in st_mod.supplier_processes(sup) if m in st_mod.SUPPLIERS[sup][p]] or procs
+            if self.v["gen_proc"].get() not in procs:
+                self._gen_in_material = True       # keep the material while the process follows it
+                try:
+                    self.v["gen_proc"].set(procs[0])
+                finally:
+                    self._gen_in_material = False
+
+    def _gen_supplier(self):
+        """Supplier picked: limit the process list to what it offers, then the material list."""
+        st_mod = getattr(propgen, "structure", None) if propgen else None
+        if st_mod is None or not hasattr(self, "gen_proc_menu"):
+            return
+        sup = self.v["gen_sup"].get()
+        procs = st_mod.supplier_processes(sup)
+        self.gen_proc_menu.configure(values=procs)
+        mat, proc = self.v["gen_mat"].get(), self.v["gen_proc"].get()
+        own = [p for p in procs if mat in st_mod.supplier_materials(sup, p)]   # keep the material if offered
+        want = proc if (proc in own or (not own and proc in procs)) else (own or procs)[0]
+        if want != proc:
+            self.v["gen_proc"].set(want)     # the trace refreshes the materials
+        else:
+            self._gen_process()
+
+    def _gen_process(self):
+        """Process (or supplier) changed: show the supplier's materials for it; keep the material if offered."""
+        st_mod = getattr(propgen, "structure", None) if propgen else None
+        if st_mod is None or not hasattr(self, "gen_mat_menu"):
+            return
+        sup, proc = self.v["gen_sup"].get(), self.v["gen_proc"].get()
+        mats = st_mod.supplier_materials(sup, proc)       # Generic: the materials usually made this way
+        self.gen_mat_menu.configure(values=mats + ["Custom"])
+        m = self.v["gen_mat"].get()
+        if sup != "Generic" and m not in mats and mats and not getattr(self, "_gen_in_material", False):
+            self.v["gen_mat"].set(mats[0])
+
+    def _gen_density_typed(self):
+        if getattr(self, "_setting_density", False):
+            return
+        m = self.v["gen_mat"].get()
+        if m == "Custom" or m not in self.GEN_MATERIALS:
+            return
+        ref = self._gen_mat_values(m)
+        try:
+            same = all(abs(float(self.v[k].get().replace(",", ".")) - float(ref[k])) < 1e-9 for k in ref)
+        except ValueError:
+            same = False
+        if not same:
+            self.v["gen_mat"].set("Custom")
+
+    def _gen_tip_rows(self):
+        t = self.v["gen_tip"].get()
+        for kind, ws in self.gen_tip_widgets.items():
+            for w in ws:
+                w.grid() if kind == t else w.grid_remove()
+
+    def _gen_span(self, key, label):
+        s = self.v[key].get().strip().replace(" ", "").replace("–", "-")
+        m = re.fullmatch(r"([0-9]*[.,]?[0-9]+)-([0-9]*[.,]?[0-9]+)", s)
+        if not m:
+            raise InputError(key, f"{label}: type from-to fractions of the radius, e.g. 0.5-0.95.")
+        a, b = (float(x.replace(",", ".")) for x in m.groups())
+        if not 0.1 <= a < b <= 1.0:
+            raise InputError(key, f"{label}: from 0.1 to 1.0, the first number smaller (got {s}).")
+        return a, b
+
+    def _gen_features(self):
+        """propgen BladeFeatures from the form; raises InputError naming the field to fix."""
+        import features as feat_mod
+        f = feat_mod.BladeFeatures()
+        f.sweep_deg = self._num("gen_sweep", "Sweep", lo=-30, hi=60) or 0.0
+        f.sweep_start = self._num("gen_sweep0", "Sweep from", lo=0.15, hi=0.9) or 0.35
+        d = self._num("gen_serr", "Serration depth", lo=0, hi=40)
+        if d:
+            f.serration_depth = d / 100
+            f.serration_width = (self._num("gen_serr_w", "Tooth width", lo=4, hi=100, required=True)) / 100
+            f.serration_start, f.serration_end = self._gen_span("gen_serr_span", "Teeth span")
+        a = self._num("gen_tub", "Tubercle amplitude", lo=0, hi=15)
+        if a:
+            f.tubercle_amp = a / 100
+            f.tubercle_wavelength = (self._num("gen_tub_w", "Tubercle wavelength", lo=10, hi=150,
+                                               required=True)) / 100
+            f.tubercle_start, f.tubercle_end = self._gen_span("gen_tub_span", "Tubercle span")
+        t = self.v["gen_tip"].get()
+        if t == "Winglet":
+            f.tip = "winglet"
+            f.winglet_height = self._num("gen_wl_h", "Winglet length", lo=2, hi=25, required=True) / 100
+            f.winglet_cant = self._num("gen_wl_cant", "Winglet cant", lo=30, hi=100, required=True)
+            f.winglet_dir = "up" if self.v["gen_wl_dir"].get() == "Up" else "down"
+        elif t == "Raked":
+            f.tip = "raked"
+            f.rake_deg = self._num("gen_rake", "Rake angle", lo=10, hi=65, required=True)
+            f.rake_len = self._num("gen_rake_len", "Rake length", lo=4, hi=30, required=True) / 100
+        try:
+            return f.validate()
+        except ValueError as exc:
+            raise InputError("gen_sweep", str(exc)) from None
+
+    def _gen_pitch(self):
+        s = self.v["gen_pitch"].get().strip().lower().replace(" ", "")
+        if not s:
+            return None
+        inch = s.endswith(("in", '"', "inch"))
+        num = re.sub(r'(inch|in|"|mm)$', "", s)
+        try:
+            x = float(num.replace(",", "."))
+        except ValueError:
+            raise InputError("gen_pitch", f"Pitch: '{s}' is not a number (mm, or add 'in' for inches, e.g. "
+                                          "6in).") from None
+        mm = x * 25.4 if inch else x
+        if not 5 <= mm <= 5000:
+            raise InputError("gen_pitch", f"Pitch must be between 5 and 5000 mm (got {mm:g} mm).")
+        return mm
+
+    GEN_CW = {"Solid (prop material)": "solid", "Steel rod insert": "steel", "Brass rod insert": "brass",
               "Lead rod insert": "lead", "Tungsten rod insert": "tungsten", "None (balance it yourself)": "none"}
 
     def _gen_cw_rows(self):
@@ -3379,6 +4160,52 @@ class App:
         self._enable(self.gen_step_btn, have)
         self._enable(self.gen_use_btn, have and not self.sim_busy)
 
+    def _gen_hub_rows(self):
+        """Show the hub fields that apply."""
+        if not hasattr(self, "gen_hub_widgets"):
+            return
+
+        def num(k):
+            try:
+                return float(self.v[k].get().replace(",", ".") or 0)
+            except ValueError:
+                return 0.0
+        holes = num("gen_holes") > 0
+        on = {"edge": self.v["gen_edge"].get() != "Sharp", "spinner": self.v["gen_spinner"].get() != "None",
+              "hex": num("gen_hex") > 0, "holes": holes,
+              "head": holes and self.v["gen_head"].get() != "None",
+              "cbore": holes and self.v["gen_head"].get() == "Counterbore"}
+        for g, ws in self.gen_hub_widgets.items():
+            for w in ws:
+                w.grid() if on.get(g, True) else w.grid_remove()
+
+    def _gen_hub(self):
+        """hubgeom.HubOptions from the form."""
+        def n(key, label, lo=0.0, hi=500.0, default=0.0, **kw):
+            x = self._num(key, label, lo=lo, hi=hi, **kw)
+            return default if x is None else x
+        holes = int(n("gen_holes", "Mount holes", hi=12))
+        if abs(holes - n("gen_holes", "Mount holes", hi=12)) > 1e-9:
+            raise InputError("gen_holes", "Mount holes: a whole number (0 to 12).")
+        try:
+            return hubgeom.HubOptions(
+                edge=self.v["gen_edge"].get().lower(), edge_mm=n("gen_edge_mm", "Edge size", hi=50, default=1.0),
+                spinner=self.v["gen_spinner"].get().lower(),
+                spinner_length_mm=self._num("gen_spinner_len", "Spinner length", lo=0, open_lo=True, hi=1000),
+                spinner_pocket_mm=n("gen_pocket", "Spinner pocket", hi=200),
+                holes=holes, hole_mm=n("gen_hole_d", "Hole size", lo=0.3, hi=50, default=3.2),
+                hole_circle_mm=n("gen_pcd", "Bolt circle", lo=1, hi=500, default=16.0),
+                hole_head=self.v["gen_head"].get().lower(), head_mm=n("gen_head_d", "Head size", hi=60, default=6.0),
+                head_depth_mm=n("gen_head_dep", "Head depth", hi=100, default=3.0),
+                bore_tolerance_mm=n("gen_tol", "Bore tolerance", lo=-2, hi=2),
+                dflat_mm=n("gen_dflat", "D-flat", hi=50), set_screw_mm=n("gen_setscrew", "Set screw", hi=30),
+                nut_hex_mm=n("gen_hex", "Nut pocket", hi=100), nut_depth_mm=n("gen_hex_d", "Pocket depth", hi=100,
+                                                                             default=3.0),
+                fillet_mm=n("gen_fillet", "Root fillet", hi=30),
+                blade_offset_mm=n("gen_offset", "Blade offset", lo=-200, hi=200))
+        except ValueError as exc:
+            raise InputError("gen_hub", str(exc)) from None
+
     def _gen_spec(self):
         """propgen.DesignSpec from the form; raises InputError naming the field to fix."""
         goal = self.GEN_GOALS.get(self.v["gen_goal"].get(), "max_thrust")
@@ -3386,14 +4213,26 @@ class App:
         kw = dict(goal=goal, airspeed=self._num("airspeed", "Airspeed", lo=0, hi=propgen.MAX_AIRSPEED) or 0.0,
                   rho=self._num("rho", "Air density", lo=0.05, hi=2.0, required=True),
                   blades=int(self.v["gen_blades"].get()),
-                  counterweight=self.GEN_CW.get(self.v["gen_cw"].get(), "printed"),
-                  material_density=self._num("gen_dens", "Print density", lo=0.3, hi=8.0) or 1.24,
+                  counterweight=self.GEN_CW.get(self.v["gen_cw"].get(), "solid"),
+                  material_density=self._num("gen_dens", "Density", lo=0.3, hi=25.0, required=True),
+                  material=self.v["gen_mat"].get(), process=self.v["gen_proc"].get(),
+                  strength_mpa=self._num("gen_uts", "Strength", lo=1, hi=5000, required=True),
+                  modulus_gpa=self._num("gen_mod", "Modulus", lo=0.05, hi=500, required=True),
+                  safety_factor=self._num("gen_sf", "Safety factor", lo=1, hi=10, required=True),
+                  alt_load=(self._num("gen_alt", "Vibration load", lo=0, hi=150) or 0.0) / 100,
+                  fatigue=bool(self._num("gen_alt", "Vibration load", lo=0, hi=150)),
+                  respect_strength=bool(self.gen_respect.get()),
+                  pitch_mm=self._gen_pitch(),
+                  pitch_mode="constant" if self.v["gen_pmode"].get() == "Constant" else "p75",
+                  features=self._gen_features(),
                   max_diameter_mm=self._num("gen_dmax", "Max diameter", lo=30, hi=3000, required=True),
                   diameter_mm=self._num("gen_dfix", "Fixed diameter", lo=30, hi=3000),
                   max_tip_mach=self._num("gen_mach", "Max tip Mach", lo=0.15, hi=propgen.MAX_TIP_MACH,
                                          required=True),
                   bore_mm=self._num("gen_bore", "Shaft bore", lo=0.5, hi=200) or 5.0,
                   hub_diameter_mm=self._num("gen_hub", "Hub diameter", lo=3, hi=500),
+                  hub_height_mm=self._num("gen_hub_h", "Hub height", lo=2, hi=500),
+                  hub=self._gen_hub(),
                   airfoil=self.gen_airfoils.get(self.v["gen_airfoil"].get(), "clarky"),
                   spin=self.v["gen_spin"].get().lower(), aero=self.v["aero"].get(),
                   nf_model=self.v["nf_model"].get(), ncrit=self._num("ncrit", "Ncrit", lo=1, hi=14) or 9.0)
@@ -3490,6 +4329,10 @@ class App:
             d = propgen.design(replace(spec, airfoil=best["airfoil"]), progress=say)
             say("Checking the design: slicing its 3D model and analysing it")
             v = propgen.verify(d, progress=say)
+            try:
+                v["preview"] = propgen.preview_mesh(d)
+            except Exception:  # noqa: BLE001 - the shaded view is a nicety
+                traceback.print_exc()
             self._post(self._gen_done, d, v, None, "", (rows, spec, cancel.is_set()))
         except BaseException as e:  # noqa: BLE001 - the window must always hear back
             self._post(self._gen_done, None, None, self._describe(e), traceback.format_exc())
@@ -3500,6 +4343,10 @@ class App:
             d = propgen.design(spec, progress=say)
             say("Checking the design: slicing its 3D model and analysing it")
             v = propgen.verify(d, progress=say)
+            try:
+                v["preview"] = propgen.preview_mesh(d)
+            except Exception:  # noqa: BLE001 - the shaded view is a nicety
+                traceback.print_exc()
             self._post(self._gen_done, d, v, None, "")
         except BaseException as e:  # noqa: BLE001 - the window must always hear back
             self._post(self._gen_done, None, None, self._describe(e), traceback.format_exc())
@@ -3549,12 +4396,22 @@ class App:
             warns.insert(0, (f"diameter set by {d.limited_by}", CYAN))
         if cw:
             warns.insert(0, (f"counterweight {cw['mass_g']:.1f} g opposite the blade" + (
-                f": {cw['kind']} rod Ø{cw['rod_diameter_mm']:g} × {cw['rod_length_mm']:.1f} mm in a printed pod"
-                if cw["rod_diameter_mm"] > 0 else ", printed solid") + f" ({cw['material_density']:g} g/cm³, 100 % "
-                "infill); details in the report", MAGENTA))
+                f": {cw['kind']} rod Ø{cw['rod_diameter_mm']:g} × {cw['rod_length_mm']:.1f} mm in the pod"
+                if cw["rod_diameter_mm"] > 0 else ", solid") + f" ({cw['material_density']:g} g/cm³, fully solid "
+                "part); details in the report", MAGENTA))
+        f = d.spec.features
+        if f.any:
+            chips.insert(1, (" · ".join(x for x, on in (("swept", abs(f.sweep_deg) > 0.05), ("serrated", f.serrated),
+                                                     ("tubercles", f.tubercles), ("winglet", f.winglet),
+                                                     ("raked tip", f.raked)) if on), AMBER))
+        if d.spec.pitch_mm:
+            chips[0] = (chips[0][0] + (" (set, 75 % R)" if d.spec.pitch_mode == "p75" else " (set, constant)"), GREEN)
+        chips.insert(1, (f"{d.spec.material} · {d.spec.process.lower()}", GREEN))
         self.gen_strip.set(d.name, chips, warns)
         t = self.gen_tiles
-        t["size"].set(f"{D / 25.4:.1f}×{d.pitch75_mm / 25.4:.1f}", "in",
+        def _in(x):
+            return f"{x / 25.4:.1f}".rstrip("0").rstrip(".")
+        t["size"].set(f"{_in(D)}×{_in(d.pitch75_mm)}", "in",
                       f"{D:.0f} mm diameter · {d.pitch75_mm:.0f} mm pitch · {nb}")
         t["rpm"].set(f"{d.rpm / 1000:.1f}k" if d.rpm >= 10000 else f"{d.rpm:,.0f}", "rpm",
                      f"{d.rpm:,.0f} rpm · Mach {d.tip_mach:.2f}")
@@ -3575,27 +4432,35 @@ class App:
         dT = rel.get("thrust_N", float("nan")) * 100
         t["check"].set(f"{dT:+.1f}", "%", "thrust, sliced model" if v.get("ok") else "check failed: see notes",
                        warn=not v.get("ok"))
+        stt, vb = d.structure, d.vibration
+        # the resonance verdict first: the narrow tile drops trailing '·' parts
+        if vb is None:
+            vib = ""
+        elif vb["ok"]:
+            vib = "no resonance · "
+        else:
+            m0 = vb["resonant"][0]
+            vib = f"RESONANT {m0['name'].split('. ')[-1]} ≈ {m0['nearest_order']}P · "
+        if stt:
+            t["strength"].set(f"{stt['sf_overall']:.2f}" if stt["sf_overall"] < 99.5 else ">99", "SF",
+                              vib + ("" if stt["ok"] else f"need {d.spec.safety_factor:g} · ")
+                              + f"{stt['governing']} · {stt['mat']['material'][:18]}",
+                              bar=min(stt["sf_overall"] / max(2 * d.spec.safety_factor, 1e-9), 1.0),
+                              warn=not stt["ok"] or (vb is not None and not vb["ok"]))
+        else:
+            t["strength"].set("—", "", vib + "not checked", warn=vb is not None and not vb["ok"])
         x = np.asarray(d.r_mm) / (D / 2)
         self.gen_shape.set_data(x, [dict(y=d.chord_mm, label="chord", color=GREEN, axis="L", fill=True, unit="mm"),
                                     dict(y=d.beta_deg, label="β", color=VIOLET, axis="R", unit="°")])
-        rows = sorted(d.scan, key=lambda s: s["diameter_mm"])
-        if rows:
-            xs = [s["diameter_mm"] for s in rows]
-            eff = [s["fom"] if d.airspeed == 0 else s["efficiency"] for s in rows]
-            bad = np.array([not s["feasible"] for s in rows])
-            tgt = d.spec.goal == "target_thrust"
-            self.gen_scan.set_data(xs, [dict(y=[s["power_W"] if tgt else s["thrust_N"] for s in rows],
-                                             label="shaft power" if tgt else "thrust", color=MAGENTA if tgt else CYAN,
-                                             axis="L", fill=True, unit="W" if tgt else "N"),
-                                        dict(y=eff, label="FM" if d.airspeed == 0 else "η", color=GREEN, axis="R")],
-                                   marker=(D, f"chosen {D:.0f} mm"), bands=self._bands(np.asarray(xs, float), bad),
-                                   band_label="not feasible",
-                                   ylabel=("shaft power [W]", "P [W]") if tgt else ("thrust [N]", "T [N]"),
-                                   ylabel2=("figure of merit", "FM") if d.airspeed == 0 else ("efficiency", "η"))
+        self._gen_chart_d = d
+        self._gen_chart()
         o = v.get("outcome")
         if o is not None:
             try:
                 self.gen_view.set_model(o.geom, o.mesh, o.res, pod=d.counterweight)
+                pv = v.get("preview")
+                if pv is not None:
+                    self.gen_view.set_solid(pv[0], pv[1], frame=o.geom.to_analysis_frame)
             except Exception as ex:  # noqa: BLE001 - the preview is a nicety
                 traceback.print_exc()
                 self.gen_view.clear()
@@ -3613,6 +4478,54 @@ class App:
             parts.append(("".join(f"note: {n}\n" for n in d.notes) + "\n", "warn"))
         parts.append((propgen.summary_text(d).lstrip("\n"), None))
         self._gen_set_text(parts)
+
+    def _gen_chart(self):
+        """The lower-right generator chart: the diameter scan or the Campbell (vibration) diagram."""
+        d = self._gen_chart_d
+        ch = self.gen_scan
+        if self.gen_chart_kind.get() == "Vibration":
+            ch.title, ch.xlabel, ch.xfmt = "Campbell", "rotation speed [rpm]", lambda v, s: f"{v:,.0f}"
+            vb = d.vibration if d is not None else None
+            if not vb:
+                ch.set_data(None, empty="Generate a propeller to see its blade frequencies"
+                            if d is None else "No vibration check for this design (see the report)")
+                return
+            xs = np.asarray(vb["speeds_rpm"], float)
+            cols = {"flap": CYAN, "lag": MAGENTA, "torsion": VIOLET}
+            seen, ser = set(), []
+            for k in vb["orders"]:
+                ser.append(dict(y=k * xs / 60, label="1P-4P" if k == vb["orders"][0] else "", color=MUTED,
+                                axis="L", dash=(4, 4), unit="Hz"))
+            fmax = 1.15 * max(vb["orders"]) * xs[-1] / 60
+            for md in vb["modes"]:
+                if md["freq"][0] > fmax and md["freq_design"] > fmax:
+                    continue
+                kind = md["kind"]
+                ser.append(dict(y=np.minimum(md["freq"], fmax), label=kind if kind not in seen else "",
+                                color=AMBER if md["resonant"] else cols[kind], axis="L", unit="Hz"))
+                seen.add(kind)
+            ch.set_data(xs, ser, marker=(vb["rpm"], f"{vb['rpm']:,.0f} rpm"), ylabel=("frequency [Hz]", "f [Hz]"),
+                        ylabel2="")
+            return
+        ch.title, ch.xlabel, ch.xfmt = "Diameter scan", "diameter [mm]", lambda v, s: f"{v:,.0f}"
+        rows = sorted(d.scan, key=lambda s: s["diameter_mm"]) if d is not None else []
+        if not rows:
+            ch.set_data(None, empty="The diameters tried appear here")
+            return
+        D = d.diameter_mm
+        if rows:
+            xs = [s["diameter_mm"] for s in rows]
+            eff = [s["fom"] if d.airspeed == 0 else s["efficiency"] for s in rows]
+            bad = np.array([not s["feasible"] for s in rows])
+            tgt = d.spec.goal == "target_thrust"
+            ch.set_data(xs, [dict(y=[s["power_W"] if tgt else s["thrust_N"] for s in rows],
+                                             label="shaft power" if tgt else "thrust", color=MAGENTA if tgt else CYAN,
+                                             axis="L", fill=True, unit="W" if tgt else "N"),
+                                        dict(y=eff, label="FM" if d.airspeed == 0 else "η", color=GREEN, axis="R")],
+                                   marker=(D, f"chosen {D:.0f} mm"), bands=self._bands(np.asarray(xs, float), bad),
+                                   band_label="not feasible",
+                                   ylabel=("shaft power [W]", "P [W]") if tgt else ("thrust [N]", "T [N]"),
+                                   ylabel2=("figure of merit", "FM") if d.airspeed == 0 else ("efficiency", "η"))
 
     def _gen_file(self, ext):
         d = self.gen[0]
@@ -3646,11 +4559,13 @@ class App:
         self.gen_t0 = time.time()
         self._gen_buttons()
         self.header.set_busy(True)
-        self.status.set("Building the STEP solid (OpenCASCADE loft + fuse)…", "busy", right="")
+        self.status.set("Building the STEP solid (B-spline blades + hub, fused; up to a few minutes for blades "
+                        "with tubercles)…", "busy", right="")
 
         def work():
             try:
-                info = propgen.export_step(d, p, progress=lambda m: self._post(self.status.set, m, "busy"))
+                info = propgen.export_step(d, p, progress=lambda m: self._post(self.status.set, m, "busy"),
+                                           mode=self.v["gen_step"].get().lower())
                 self._post(self._gen_step_done, p, info, None)
             except BaseException as e:  # noqa: BLE001
                 traceback.print_exc()
@@ -3665,7 +4580,13 @@ class App:
             self._show_banner(f"Could not export the STEP file: {err}")
             self.status.set("STEP export failed", "error")
         else:
-            self.status.set(f"Saved {p} (millimetres, spin axis Z)", "ok", right=f"{time.time() - self.gen_t0:.1f} s")
+            ck = (info or {}).get("check") or {}
+            nvol = (info or {}).get("volumes", 1)
+            bad = ck.get("open_edges", 0) or nvol != 1
+            self.status.set(f"Saved {p} ({info.get('mode', 'exact')}, millimetres, spin axis Z): "
+                            + (f"{nvol} solid(s), {ck.get('open_edges', '?')} open edges - check it before use"
+                               if bad else "one closed solid"),
+                            "warn" if bad else "ok", right=f"{time.time() - self.gen_t0:.1f} s")
 
     def _gen_use(self):
         """Load the generated prop into the main simulation (as an STL in the temp folder) and run it."""
@@ -3674,7 +4595,11 @@ class App:
         d = self.gen[0]
         p = os.path.join(tempfile.gettempdir(), "propsim_" + self._gen_file(".stl"))
         try:
-            propgen.export_stl(d, p, quality="normal")
+            # without the details the slicer cannot read (teeth, tubercles, winglet); their effects go to the
+            # analysis as options instead, the way the generator's own check does it
+            propgen.build_mesh(d, "normal", details=False, hub_cuts=False).export(p)
+            import features as feat_mod
+            self.gen_model_extra = (os.path.normcase(os.path.abspath(p)), feat_mod.analysis_argv(d.spec.features))
         except Exception as e:  # noqa: BLE001
             self._show_banner(f"Could not write the model: {self._describe(e)}")
             return
@@ -3743,6 +4668,11 @@ def main():
         if getattr(sys, name) is None:
             setattr(sys, name, open(os.devnull, "w"))
     ctk.set_appearance_mode("dark")
+    # Keep the DPI scaling the window starts with. customtkinter otherwise re-checks the monitor's
+    # scaling every 0.1 s and, when the window is dragged onto (or partly over) a monitor with other
+    # scaling, fades it out and rebuilds every widget - repeatedly while it is dragged back and forth
+    # - and the canvases, drawn at the starting scale, would no longer match the widgets.
+    ctk.ScalingTracker.update_loop_running = True
     root = ctk.CTk()
     root.title(APP_TITLE)
     Theme.init(root)

@@ -31,6 +31,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import bemt          # noqa: E402
+import features as feat_mod  # noqa: E402
 import geometry      # noqa: E402
 import motor as motor_mod  # noqa: E402
 
@@ -96,6 +97,8 @@ def parse_args(argv=None):
     pa.add_argument("--no-swirl", action="store_true", help="ignore wake swirl")
     pa.add_argument("--hub-loss", action="store_true", help="apply Prandtl hub loss as well as tip loss")
 
+    feat_mod.add_cli_args(ap, generator=False)
+
     out = ap.add_argument_group("output")
     out.add_argument("--show-geometry", action="store_true", help="print the extracted blade geometry table")
     out.add_argument("--sweep", action="store_true", help="also print a table from 20 %% to 100 %% of the operating RPM")
@@ -110,6 +113,10 @@ def parse_args(argv=None):
         ap.error("--max-torque must be positive")
     if a.cells:
         a.voltage = a.cells * a.cell_voltage
+    try:
+        a.features = feat_mod.from_args(a)
+    except ValueError as exc:
+        ap.error(str(exc))
     if a.aero == "neuralfoil":
         import sectionfoil
         sizes = sectionfoil.available_model_sizes()
@@ -158,6 +165,14 @@ def simulate(argv=None, args=None, progress=None) -> Outcome:
     say = progress or (lambda _msg: None)
     say("Reading model and slicing blades...")
     geom, name, mesh = load_geometry(a)
+    if getattr(a, "no_blade_sweep", False) and getattr(geom, "sweep", None) is not None:
+        geom.sweep = None
+        geom.notes.append("measured blade sweep ignored (--no-blade-sweep)")
+    f = getattr(a, "features", None)
+    if f is not None and f.any:
+        feat_mod.attach(geom, f)
+        geom.notes.extend(f"feature: {t}" for t in f.summary())
+        geom.notes.extend(f.notes(analysis=True))
     polar = bemt.PolarModel(cl_alpha=a.cl_alpha, cl_max=a.cl_max, cl_min=a.cl_min, cd0=a.cd0,
                             alpha0=np.radians(a.alpha0) if a.alpha0 is not None else None,
                             table=bemt.load_polar_csv(a.polar) if a.polar else None)

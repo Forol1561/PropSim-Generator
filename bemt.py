@@ -164,6 +164,25 @@ def solve(geom, rpm: float, airspeed: float = 0.0, rho: float = 1.225,
     V = float(airspeed)
     kappa = getattr(polar, "kappa", KAPPA_DEFAULT)
     k_super = getattr(polar, "k_super", KSUPER_DEFAULT)
+    # experimental blade features (features.py): sweep per station, and multipliers on chord, lift and drag
+    sweep = getattr(geom, "sweep", None)
+    swept = sweep is not None and np.any(np.abs(sweep) > 1e-4)
+    cosL = np.cos(sweep) if swept else np.ones_like(r)
+    mods = getattr(geom, "aero_mods", None) or {}
+    c_eff = c * mods.get("chord_factor", 1.0)
+    cl_f = mods.get("cl_factor", 1.0)
+    cd_f = mods.get("cd_factor", 1.0)
+    keep = np.asarray(mods.get("stall_retention", 0.0)) * np.ones_like(r)
+    R_tip = R * mods.get("tip_radius_factor", 1.0)
+    soft = bool(np.any(keep > 0)) and getattr(polar, "table", None) is None
+
+    def stall_angle(re_, mach_):
+        if hasattr(polar, "stall_angles"):
+            if np.ndim(re_) == 2:            # the bracketing grid: one row per trial inflow
+                return np.array([polar.stall_angles(a, b) for a, b in zip(re_, np.broadcast_to(mach_, re_.shape))])
+            return polar.stall_angles(re_, mach_)
+        a0 = -2.0 * cam if polar.alpha0 is None else polar.alpha0
+        return a0 + polar.cl_max / (polar.cl_alpha / np.sqrt(1 - np.minimum(mach_, 0.7) ** 2))
 
     def element(vi):
         ua = V + vi
@@ -173,16 +192,34 @@ def solve(geom, rpm: float, airspeed: float = 0.0, rho: float = 1.225,
             w2 = ua ** 2 + ut ** 2
             phi = np.arctan2(ua, ut)
             alpha = beta - phi
-            re = rho * np.sqrt(w2) * c / MU_AIR
+            re = rho * np.sqrt(w2) * c_eff / MU_AIR
             mach = np.sqrt(w2) / A_SOUND
-            cl, cd = polar.coefficients(alpha, cam, tc, re, mach)
-            cd = cd + wave_drag(mach, cl, tc, kappa, k_super, cam)
+            # simple sweep theory: the section works on the velocity normal to its swept stacking line
+            alpha_n = np.arctan(np.tan(alpha) / cosL) if swept else alpha
+            mach_n = mach * cosL
+            cl, cd = polar.coefficients(alpha_n, cam, tc, re, mach_n)
+            if soft:
+                # tubercles: past stall the lift falls off gradually instead of collapsing
+                a_s = stall_angle(re, mach_n)
+                cl_s = polar.coefficients(a_s, cam, tc, re, mach_n)[0]
+                post = alpha_n > a_s
+                hold = keep * cl_s * cl_f * np.exp(-np.maximum(alpha_n - a_s, 0) / np.radians(12.0))
+                cl = np.where(post, np.maximum(cl * cl_f, hold), cl * cl_f)
+            else:
+                cl = cl * cl_f
+            cd = cd * cd_f
+            if swept:
+                c2 = cosL * cosL
+                cd = cd + wave_drag(mach_n, cl, tc / cosL, kappa, k_super, cam / cosL) * c2 * cosL
+                cl = cl * c2
+            else:
+                cd = cd + wave_drag(mach, cl, tc, kappa, k_super, cam)
             cn = cl * np.cos(phi) - cd * np.sin(phi)
             ctan = cl * np.sin(phi) + cd * np.cos(phi)
-            q = 0.5 * rho * w2 * c * B
+            q = 0.5 * rho * w2 * c_eff * B
             dT, dQ = q * cn, q * ctan * r
             sphi = np.maximum(np.abs(np.sin(phi)), 1e-6)
-            f_tip = B / 2.0 * (R - r) / (r * sphi)
+            f_tip = B / 2.0 * (R_tip - r) / (r * sphi)
             f_hub = B / 2.0 * (r - Rh) / (Rh * sphi) if (hub_loss and Rh > 0) else np.full_like(r, 50.0)
             F = (2 / np.pi) ** 2 * np.arccos(np.exp(-np.clip(f_tip, 0, 50))) \
                 * np.arccos(np.exp(-np.clip(f_hub, 0, 50)))
@@ -192,7 +229,7 @@ def solve(geom, rpm: float, airspeed: float = 0.0, rho: float = 1.225,
                 vt_new = np.clip(dQ / denom, 0, 0.5 * omega * r)
                 vt = 0.5 * vt + 0.5 * vt_new
         resid = dT - 4 * np.pi * r * rho * ua * vi * F
-        return resid, dict(alpha=alpha, phi=phi, cl=cl, cd=cd, re=re, mach=mach,
+        return resid, dict(alpha=alpha, alpha_n=alpha_n, phi=phi, cl=cl, cd=cd, re=re, mach=mach,
                            dT=dT, dQ=dQ, F=F, vi=vi, vt=vt)
 
     # Bracket each station's first root counted up from vi = 0 on a fixed grid of inflow angles (one
@@ -232,8 +269,19 @@ def solve(geom, rpm: float, airspeed: float = 0.0, rho: float = 1.225,
 
     # Integrate from the first station out to the tip (loads vanish at r = R)
     rr = np.append(r, R)
-    T = float(np.trapezoid(np.append(st["dT"], 0.0), rr))
-    Q = float(np.trapezoid(np.append(st["dQ"], 0.0), rr))
+    # loads vanish at the tip; with a winglet (effective tip radius beyond R) they do not quite
+    k_end = float(np.sqrt(max(R_tip - R, 0.0) / max(R_tip - r[-1], 1e-9))) if R_tip > R else 0.0
+    T = float(np.trapezoid(np.append(st["dT"], k_end * st["dT"][-1]), rr))
+    Q = float(np.trapezoid(np.append(st["dQ"], k_end * st["dQ"][-1] * R / r[-1]), rr))
+    if mods.get("winglet_area", 0.0) > 0:
+        # the winglets' own drag (profile + wave drag at the tip speed); it acts along the tip's
+        # relative wind, so mostly as torque
+        w_t = np.hypot(omega * R, V + st["vi"][-1])
+        cdw = 0.010 + float(wave_drag(w_t / A_SOUND, 0.0, mods.get("winglet_tc", 0.08), kappa, k_super))
+        Dw = B * 0.5 * rho * w_t ** 2 * mods["winglet_area"] * cdw
+        Q += Dw * R * omega * R / w_t
+        T -= Dw * (V + st["vi"][-1]) / w_t
+        st["winglet_drag"] = Dw
     P = Q * omega
     n = rpm / 60.0
     D = 2 * R
@@ -243,15 +291,16 @@ def solve(geom, rpm: float, airspeed: float = 0.0, rho: float = 1.225,
     area = np.pi * R ** 2
     fom = (max(T, 0) ** 1.5 / np.sqrt(2 * rho * area)) / P if (V == 0 and P > 0) else 0.0
     if hasattr(polar, "stall_angles"):       # per-station polars know their own stall angles
-        stalled = st["alpha"] > polar.stall_angles(st["re"], st["mach"])
+        stalled = st["alpha_n"] > polar.stall_angles(st["re"], st["mach"] * cosL)
     elif polar.table is None:
         a0 = -2.0 * cam if polar.alpha0 is None else polar.alpha0
-        stalled = st["alpha"] > a0 + polar.cl_max / polar.cl_alpha
+        stalled = st["alpha_n"] > a0 + polar.cl_max / polar.cl_alpha
     else:
         stalled = np.zeros_like(r, bool)
     st["stalled"] = stalled
+    st["sweep"] = np.arccos(np.clip(cosL, -1, 1)) * (np.sign(sweep) if swept else 1)
     if hasattr(polar, "confidence"):
-        st["confidence"] = polar.confidence(st["alpha"], st["re"], st["mach"])
+        st["confidence"] = polar.confidence(st["alpha_n"], st["re"], st["mach"] * cosL)
     st["r"] = r
     return BEMTResult(
         rpm=rpm, airspeed=V, thrust=T, torque=Q, power=P, ct=ct, cp=cp,
