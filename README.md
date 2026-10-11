@@ -1,4 +1,4 @@
-DISCLAIMER: This Repository is FULLY AI generated
+DISCLAIMER: This Repository contains AI generated CODE
 
 
 
