@@ -1281,7 +1281,9 @@ class _Designer:
         dd = profile.pop("design")
         hub_o, hub_notes = sp.hub.check(2 * ctx.rh * 1e3, ctx.hub_h * 1e3, sp.bore_mm, ctx.B)
         profile["hub"] = hub_o
-        notes += hub_notes
+        # a hub feature that was asked for and left out goes first, so the app shows it
+        notes[:0] = [n for n in hub_notes if n.startswith("HUB")]
+        notes += [n for n in hub_notes if not n.startswith("HUB")]
         rdense = profile["r"]
         rs = np.linspace(ctx.rh, ctx.R, max(sp.stations, 5))
         ds = _eval(ctx, vp, rs, detail=True)
@@ -3026,12 +3028,16 @@ def export_step(design: PropDesign, path: str, progress=None, mode: str = "exact
                 C = C * mir
             say("STEP: hub...")
             hub = hubgeom.hub_occ(occ, o, rh, h)
-            # the hub's holes stay clear of the blade roots (hubgeom.check), so they are cut from the hub
-            # alone: much faster than from the fused prop
+            # holes clear of the blade roots are cut from the hub alone (much faster than from the fused
+            # prop); holes near the hub's edge, where the blade roots reach in, after the fuse
             tools = [(3, t) for t in hubgeom.hub_cutters_occ(occ, o, rh, h, p["bore"] * 1e3, B, ysign=int(ys))]
-            hub_cut, _ = occ.cut([(3, hub)], tools)
+            late = hubgeom.cuts_reach_blades(o, rh, p["bore"] * 1e3)
+            hub_cut = [(3, hub)] if late else occ.cut([(3, hub)], tools)[0]
             say("STEP: fusing blades and hub...")
             out, _ = occ.fuse(hub_cut, blades + pod)
+            if late:
+                say("STEP: cutting the hub holes...")
+                out, _ = occ.cut(out, tools)
             if cw and cw["rod_diameter_mm"] > 0:
                 H4 = 4 * cw["height_mm"]
                 rod = occ.addCylinder(C[0], C[1], C[2] - H4 / 2, 0, 0, H4, cw["rod_diameter_mm"] / 2)

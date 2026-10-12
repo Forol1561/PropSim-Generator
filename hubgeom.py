@@ -42,6 +42,7 @@ class HubOptions:
     head_mm: float = 6.0                # head recess diameter
     head_depth_mm: float = 3.0          # counterbore depth
     bore_tolerance_mm: float = 0.0      # added to the bore diameter (+ clearance, - press fit)
+    bore_depth_mm: float = 0.0          # blind bore: depth from the bottom (motor side); 0 = all the way
     dflat_mm: float = 0.0               # depth of a flat on the bore (0 = round bore)
     set_screw_mm: float = 0.0           # radial set-screw hole diameter, at mid-height (0 = none)
     nut_hex_mm: float = 0.0             # across-flats of a hex pocket for a prop nut in the front face
@@ -56,7 +57,7 @@ class HubOptions:
                 raise ValueError(f"hub {name.replace('_', ' ')} must be one of {', '.join(allowed)}")
             setattr(self, name, v)
         for name in ("edge_mm", "spinner_pocket_mm", "hole_mm", "hole_circle_mm", "head_mm", "head_depth_mm",
-                     "dflat_mm", "set_screw_mm", "nut_hex_mm", "nut_depth_mm", "fillet_mm"):
+                     "dflat_mm", "set_screw_mm", "nut_hex_mm", "nut_depth_mm", "fillet_mm", "bore_depth_mm"):
             if getattr(self, name) < 0:
                 raise ValueError(f"hub {name.replace('_mm', '').replace('_', ' ')} must not be negative")
         if self.holes < 0 or self.holes > 12:
@@ -80,9 +81,9 @@ class HubOptions:
         need = 0.0
         if self.holes:
             head = self.head_mm if self.hole_head != "none" else self.hole_mm
-            need = max(need, self.hole_circle_mm + max(self.hole_mm, head) + 4.6)
+            need = max(need, self.hole_circle_mm + max(self.hole_mm, head) + 2 * AUTO_WALL_MM + 0.01)
         if self.nut_hex_mm:
-            need = max(need, 2 * self.nut_hex_mm / math.sqrt(3) + 4.6)
+            need = max(need, 2 * self.nut_hex_mm / math.sqrt(3) + 2 * AUTO_WALL_MM + 0.01)
         return need
 
     def spinner_length(self, rh_mm):
@@ -94,6 +95,23 @@ class HubOptions:
 
     def bore_d(self, bore_mm):
         return max(bore_mm + self.bore_tolerance_mm, 0.1)
+
+    def bore_top(self, rh_mm, h_mm):
+        """z of the bore's end (hub centred on z = 0, mm): through the hub (into the spinner's pocket, or
+        under a solid spinner), or bore_depth_mm from the bottom."""
+        L = self.spinner_length(rh_mm)
+        zb, zt = -h_mm / 2, h_mm / 2
+        through = zt + (L * 0.7 if (L and self.spinner_pocket_mm) else (0.0 if L else 1.0))
+        if self.bore_depth_mm > 0:
+            return min(zb + self.bore_depth_mm, through)
+        return through
+
+    def screw_z(self, rh_mm, h_mm):
+        """Height of the set screw: mid-hub, or the middle of a short blind bore."""
+        zb, zt = -h_mm / 2, h_mm / 2
+        top = min(self.bore_top(rh_mm, h_mm), zt)
+        rs = self.set_screw_mm / 2
+        return 0.0 if top >= rs + 1.0 else 0.5 * (zb + top)
 
     def hole_angles(self, blades):
         """Angles [rad] of the mounting holes, from blade 0, counter-clockwise."""
@@ -122,27 +140,51 @@ class HubOptions:
         if o.holes:
             rc, rhole = o.hole_circle_mm / 2, o.hole_mm / 2
             head = o.head_mm / 2 if o.hole_head != "none" else rhole
-            edge_gap = root_depth_mm(rh, rb) + 0.3          # clear of the blade roots inside the hub
-            if rc - rhole < rb + 0.6 or rc + max(rhole, head) > rh - edge_gap:
-                notes.append(f"the {o.holes} mounting holes ({o.hole_mm:g} mm on a {o.hole_circle_mm:g} mm circle) "
-                             f"do not fit between the bore and the {hub_d_mm:.1f} mm hub edge; left out "
-                             "(set a bigger hub diameter)")
+            need = 2 * (rc + max(rhole, head) + MIN_WALL_MM)
+            if rc - rhole < rb + MIN_WALL_MM:
+                notes.append(f"HUB: the {o.holes} mounting holes ({o.hole_mm:g} mm on a {o.hole_circle_mm:g} mm "
+                             f"circle) run into the {2 * rb:.1f} mm shaft bore; left out (use a bigger bolt circle)")
+                o.holes = 0
+            elif hub_d_mm < need - 1e-6:
+                notes.append(f"HUB: the {o.holes} mounting holes ({o.hole_mm:g} mm on a {o.hole_circle_mm:g} mm circle"
+                             + (f", {o.hole_head} {o.head_mm:g} mm" if o.hole_head != "none" else "")
+                             + f") need a hub of at least {need:.1f} mm diameter; the hub is {hub_d_mm:.1f} mm, so "
+                             "they are left out (set the hub diameter to auto or larger, or use a smaller bolt circle)")
                 o.holes = 0
             elif o.hole_head != "none" and o.head_mm <= o.hole_mm:
                 notes.append("the screw-head recess is not wider than the hole; left out")
                 o.hole_head = "none"
         if o.nut_hex_mm:
             r_corner = o.nut_hex_mm / math.sqrt(3)
-            if r_corner > rh - root_depth_mm(rh, rb) - 0.3 or o.nut_hex_mm / 2 < rb:
-                notes.append(f"the {o.nut_hex_mm:g} mm hex pocket does not fit the hub (or is smaller than the "
+            if r_corner > rh - MIN_WALL_MM or o.nut_hex_mm / 2 < rb:
+                notes.append(f"HUB: the {o.nut_hex_mm:g} mm hex pocket does not fit the hub (or is smaller than the "
                              "bore); left out")
                 o.nut_hex_mm = 0.0
             elif o.nut_depth_mm > 0.6 * h:
                 o.nut_depth_mm = 0.6 * h
                 notes.append(f"hex pocket depth limited to {o.nut_depth_mm:.1f} mm")
-        if o.set_screw_mm and o.set_screw_mm > 0.6 * h:
-            notes.append("the set-screw hole is too big for the hub height; left out")
-            o.set_screw_mm = 0.0
+        if o.bore_depth_mm:
+            L = o.spinner_length(rh)
+            full = h + (0.7 * L if (L and o.spinner_pocket_mm) else 0.0)
+            if o.bore_depth_mm < 1.0:
+                notes.append("HUB: a bore under 1 mm deep is no bore; made it go all the way through")
+                o.bore_depth_mm = 0.0
+            elif o.bore_depth_mm >= full - 0.5:
+                if not L or o.spinner_pocket_mm:
+                    notes.append(f"the {o.bore_depth_mm:g} mm bore depth is more than the hub's "
+                                 f"{full:.1f} mm length: it goes all the way through")
+                o.bore_depth_mm = 0.0
+        if o.set_screw_mm:
+            span = min(o.bore_top(rh, h), h / 2) + h / 2      # bore length inside the hub
+            if o.set_screw_mm > 0.6 * h:
+                notes.append("HUB: the set-screw hole is too big for the hub height; left out")
+                o.set_screw_mm = 0.0
+            elif o.set_screw_mm > span - 1.0:
+                notes.append(f"HUB: the {o.set_screw_mm:g} mm set screw does not fit along the {span:.1f} mm deep "
+                             "bore; left out")
+                o.set_screw_mm = 0.0
+        if o.nut_hex_mm and o.bore_depth_mm and o.bore_top(rh, h) < h / 2 - o.nut_depth_mm:
+            notes.append("the nut pocket in the front face does not reach the blind bore (they are not connected)")
         if o.spinner != "none":
             if o.spinner_pocket_mm and o.spinner_pocket_mm / 2 > rh - 1.0:
                 o.spinner_pocket_mm = max(2 * (rh - 1.0), 0.0)
@@ -163,6 +205,8 @@ class HubOptions:
             bits.append(f"{self.spinner} spinner" + (f" ({self.spinner_length_mm:g} mm)" if self.spinner_length_mm
                                                      else "") + (f", {self.spinner_pocket_mm:g} mm pocket"
                                                                  if self.spinner_pocket_mm else ""))
+        if self.bore_depth_mm:
+            bits.append(f"bore {self.bore_depth_mm:g} mm deep from the motor side")
         if self.bore_tolerance_mm:
             bits.append(f"bore {self.bore_d(bore_mm):.2f} mm ({self.bore_tolerance_mm:+g} tolerance)")
         if self.dflat_mm:
@@ -171,6 +215,7 @@ class HubOptions:
             bits.append(f"set screw {self.set_screw_mm:g} mm")
         if self.holes:
             bits.append(f"{self.holes} x {self.hole_mm:g} mm holes on {self.hole_circle_mm:g} mm"
+                        + (f" at {self.hole_angle_deg:g} deg" if self.hole_angle_deg is not None else "")
                         + (f" ({self.hole_head} {self.head_mm:g} mm)" if self.hole_head != "none" else ""))
         if self.nut_hex_mm:
             bits.append(f"hex pocket {self.nut_hex_mm:g} mm AF x {self.nut_depth_mm:g} mm")
@@ -179,6 +224,23 @@ class HubOptions:
         if self.blade_offset_mm:
             bits.append(f"blades {self.blade_offset_mm:+g} mm along the axis")
         return ", ".join(bits)
+
+
+MIN_WALL_MM = 1.0       # thinnest wall left around a hole or pocket in the hub (and to the bore)
+AUTO_WALL_MM = 2.3      # the wall auto-sized hubs leave around mounting holes / a hex pocket
+
+
+def cuts_reach_blades(o: "HubOptions", rh_mm, bore_mm) -> bool:
+    """True when a hole or pocket comes closer to the hub's edge than the blade roots reach into the hub:
+    then the cuts must be made after the blades are joined (or the roots would fill them in again)."""
+    gap = root_depth_mm(rh_mm, o.bore_d(bore_mm) / 2) + 0.3
+    if o.holes:
+        head = o.head_mm / 2 if o.hole_head != "none" else o.hole_mm / 2
+        if o.hole_circle_mm / 2 + max(o.hole_mm / 2, head) > rh_mm - gap:
+            return True
+    if o.nut_hex_mm and o.nut_hex_mm / math.sqrt(3) > rh_mm - gap:
+        return True
+    return False
 
 
 def root_depth_mm(rh_mm, rb_mm):
@@ -271,7 +333,7 @@ def hub_cutters_manifold(o: HubOptions, rh, h, bore_mm, blades, segments=120):
     rb = o.bore_d(bore_mm) / 2
     out = []
     # the bore: through the hub; under a solid spinner it ends at the hub top
-    top = zt + (L * 0.7 if (L and o.spinner_pocket_mm) else (0.0 if L else 1.0))
+    top = o.bore_top(rh, h)
     bore = m3.Manifold.cylinder(top - (zb - 1.0), rb, rb, segments).translate((0, 0, zb - 1.0))
     if o.dflat_mm:
         d = rb - o.dflat_mm                       # flat at this distance from the axis
@@ -310,7 +372,7 @@ def hub_cutters_manifold(o: HubOptions, rh, h, bore_mm, blades, segments=120):
         rs = o.set_screw_mm / 2
         cyl = m3.Manifold.cylinder(rh + 2.0, rs, rs, 32)            # along +z from 0
         cyl = cyl.rotate((0, 90, 0)).rotate((0, 0, math.degrees(a)))   # along the screw direction
-        out.append(cyl)
+        out.append(cyl.translate((0, 0, o.screw_z(rh, h))))
     return out
 
 
@@ -388,7 +450,7 @@ def hub_cutters_occ(occ, o: HubOptions, rh, h, bore_mm, blades, ysign=1):
     big = 4 * (h + L + rh)
     rb = o.bore_d(bore_mm) / 2
     out = []
-    top = zt + (L * 0.7 if (L and o.spinner_pocket_mm) else (0.0 if L else 1.0))
+    top = o.bore_top(rh, h)
     bore = occ.addCylinder(0, 0, zb - 1.0, 0, 0, top - (zb - 1.0), rb)
     if o.dflat_mm:
         d = rb - o.dflat_mm
@@ -428,7 +490,7 @@ def hub_cutters_occ(occ, o: HubOptions, rh, h, bore_mm, blades, ysign=1):
         out += [t for dd, t in ex if dd == 3]
     if o.set_screw_mm:
         a = ysign * o.screw_angle(blades)
-        out.append(occ.addCylinder(0, 0, 0, (rh + 2.0) * math.cos(a), (rh + 2.0) * math.sin(a), 0,
+        out.append(occ.addCylinder(0, 0, o.screw_z(rh, h), (rh + 2.0) * math.cos(a), (rh + 2.0) * math.sin(a), 0,
                                    o.set_screw_mm / 2))
     return out
 
@@ -446,12 +508,16 @@ def add_cli_args(p):
     g.add_argument("--mount-holes", type=int, default=0, help="number of mounting holes on a bolt circle")
     g.add_argument("--mount-hole", type=float, default=3.2, help="mounting hole diameter [mm] (3.2 = M3)")
     g.add_argument("--mount-circle", type=float, default=16.0, help="bolt circle diameter [mm]")
-    g.add_argument("--mount-angle", type=float, help="angle of the first hole from blade 0 [deg]")
+    g.add_argument("--mount-angle", type=float,
+                   help="rotate the bolt circle: angle of the first hole from blade 0 [deg] (default: half way "
+                        "between two holes' spacing)")
     g.add_argument("--mount-head", choices=HEADS, default="none", help="screw head recess on the front")
     g.add_argument("--mount-head-size", type=float, default=6.0, help="head recess diameter [mm]")
     g.add_argument("--mount-head-depth", type=float, default=3.0, help="counterbore depth [mm]")
     g.add_argument("--bore-tolerance", type=float, default=0.0,
                    help="added to the bore diameter [mm] (+ clearance, - press fit)")
+    g.add_argument("--bore-depth", type=float, default=0.0,
+                   help="blind bore: depth from the bottom (motor side) [mm]; default all the way through")
     g.add_argument("--d-flat", type=float, default=0.0, help="depth of a flat on the bore [mm]")
     g.add_argument("--set-screw", type=float, default=0.0, help="radial set-screw hole diameter [mm]")
     g.add_argument("--nut-hex", type=float, default=0.0, help="hex pocket for a prop nut, across flats [mm]")
@@ -467,5 +533,6 @@ def from_args(a) -> HubOptions:
                       holes=a.mount_holes, hole_mm=a.mount_hole, hole_circle_mm=a.mount_circle,
                       hole_angle_deg=a.mount_angle, hole_head=a.mount_head, head_mm=a.mount_head_size,
                       head_depth_mm=a.mount_head_depth, bore_tolerance_mm=a.bore_tolerance, dflat_mm=a.d_flat,
+                      bore_depth_mm=a.bore_depth,
                       set_screw_mm=a.set_screw, nut_hex_mm=a.nut_hex, nut_depth_mm=a.nut_depth,
                       fillet_mm=a.root_fillet, blade_offset_mm=a.blade_offset)

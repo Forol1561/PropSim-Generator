@@ -140,6 +140,7 @@ stage_src() {
 
 # The applications the PropSim Allrun uses
 APPS="solvers/incompressible/simpleFoam
+solvers/compressible/rhoSimpleFoam
 utilities/mesh/generation/blockMesh
 utilities/surface/surfaceFeatureExtract
 utilities/parallelProcessing/decomposePar
@@ -204,7 +205,7 @@ This folder contains a Windows (x86-64) build of OpenFOAM v1912 (OpenFOAM-v1912.
 openfoam.com / OpenCFD Ltd.), cross-compiled with mingw-w64 (GCC $(x86_64-w64-mingw32-g++-posix -dumpversion))
 by PropSim's tools/build_cfd_engine.sh. Only the libraries and applications PropSim's 3D CFD
 uses are included: blockMesh, surfaceFeatureExtract, decomposePar, snappyHexMesh, topoSet,
-checkMesh, simpleFoam, reconstructParMesh, reconstructPar and foamDictionary.
+checkMesh, simpleFoam, rhoSimpleFoam, reconstructParMesh, reconstructPar and foamDictionary.
 
 OpenFOAM is free software, licensed under the GNU General Public License version 3 (see COPYING).
 OpenFOAM is a registered trademark of OpenCFD Ltd. This build is not approved or endorsed by

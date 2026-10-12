@@ -20,6 +20,11 @@ Checks
   6. STEP: export with gmsh/OpenCASCADE, reload through geometry.load_mesh (PropSim's gmsh path) and
      analyse: thrust and torque within 2 % of the design.
   7. Run time of design() with default settings.
+  ... 9-11: airfoils and transonic tips, single blade, motor torque limit.
+  12. Set pitch (75 % R and constant), airspeed / density, experimental blade features (sweep,
+      serrations, tubercles, winglets, raked tip: model, round trip, STEP), materials.
+  13. Blade strength: the beam model against textbook cases, designing within the limits, materials and
+      processes, unreachable limits, custom material, counterweight rod pull.
 Exit code 1 if any check fails.
 """
 
@@ -378,11 +383,13 @@ o3 = propsim.simulate(base + ["--rpm", "8000", "--max-torque", "0.08"])
 o4 = propsim.simulate(base + ["--rpm", "4000", "--max-torque", "0.08"])
 check(abs(o3.res.torque / 0.08 - 1) < 0.01 and o3.res.rpm < 8000 and o4.res.rpm == 4000 and o4.limited_by is None,
       f"rpm mode: 8000 rpm held to {o3.res.rpm:.0f} rpm; 4000 rpm (under the limit) unchanged")
-dq = propgen.design(propgen.DesignSpec(motor_power_W=400, blades=2, aero="analytic", max_torque_Nm=QL))
+# (aerodynamics and motor only here: the strength sizing is tested in section 13)
+dq = propgen.design(propgen.DesignSpec(motor_power_W=400, blades=2, aero="analytic", max_torque_Nm=QL,
+                                       respect_strength=False))
 check(dq.torque_Nm <= QL * 1.01 and dq.electrical["throttle"] <= 1.001,
       f"generator max thrust within the limit: {dq.thrust_N:.2f} N at {dq.torque_Nm:.4f} N m, {dq.rpm:.0f} rpm")
 dt = propgen.design(propgen.DesignSpec(motor_power_W=400, blades=2, aero="analytic", max_torque_Nm=QL,
-                                       goal="target_thrust", target_thrust_N=3 * dq.thrust_N))
+                                       goal="target_thrust", target_thrust_N=3 * dq.thrust_N, respect_strength=False))
 check(dt.torque_Nm <= QL * 1.01 and abs(dt.thrust_N / dq.thrust_N - 1) < 0.05
       and any(n.startswith("no candidate met every limit") for n in dt.notes),
       f"unreachable thrust target: shows the most within the limit ({dt.thrust_N:.2f} N), flagged")
@@ -397,6 +404,327 @@ capn = [n for n in dc.notes if n.startswith("chord capped")]
 check(len(capn) == 1 and capn[0] in dc.minor_notes and "can be ignored" in capn[0] and "to clear it" in capn[0]
       and not any(n.startswith("sections at their lift limit") for n in dc.notes),
       "harmless outboard chord cap (150 m/s, tip Mach 0.92): one note, marked minor, with its fix")
+
+# --------------------------------------------------------------------------- 12. set pitch, features
+print("\n12. Set pitch, airspeed / density, experimental blade features, materials")
+import features as feat_mod   # noqa: E402
+SPEC12 = dict(kv=920, cells=4, motor_power_W=400, max_diameter_mm=254, blades=2)
+for mode, inch in (("p75", 4.0), ("p75", 7.0), ("constant", 6.0)):
+    dp = propgen.design(propgen.DesignSpec(**SPEC12, pitch_mm=inch * 25.4, pitch_mode=mode))
+    vp_ = propgen.verify(dp)
+    e = vp_["rel_error"]
+    pn = [n for n in dp.notes if n.startswith("pitch set to")]
+    check(abs(dp.pitch75_mm / (inch * 25.4) - 1) < 0.01 and abs(e["thrust_N"]) < 0.02 and abs(e["torque_Nm"]) < 0.02
+          and len(pn) == 1 and "optimum" in pn[0],
+          f"pitch {inch:g} in ({mode}): {dp.name}, 75 % R pitch {dp.pitch75_mm / 25.4:.2f} in, {dp.thrust_N:.2f} N; "
+          f"round trip dT {pct(e['thrust_N'])} dQ {pct(e['torque_Nm'])}")
+    if mode == "constant":
+        pit = dp.pitch_mm[(dp.r_mm > 0.3 * dp.radius_mm) & (dp.r_mm < 0.95 * dp.radius_mm)]
+        check(np.ptp(pit) / np.mean(pit) < 0.04, f"constant pitch along the blade (spread {np.ptp(pit):.1f} mm)")
+d0 = propgen.design(propgen.DesignSpec(**SPEC12))
+d30 = propgen.design(propgen.DesignSpec(**SPEC12, airspeed=30))
+d30r = propgen.design(propgen.DesignSpec(**SPEC12, airspeed=30, rho=1.0))
+check(d30.pitch75_mm > 1.4 * d0.pitch75_mm and abs(d30r.pitch75_mm / d30.pitch75_mm - 1) > 0.02,
+      f"airspeed and density change the design: hover {d0.name}, 30 m/s {d30.name}, 30 m/s rho 1.0 {d30r.name}")
+FEATS = {
+    "sweep 35": feat_mod.BladeFeatures(sweep_deg=35),
+    "serrations": feat_mod.BladeFeatures(serration_depth=0.2, serration_width=0.15),
+    "tubercles": feat_mod.BladeFeatures(tubercle_amp=0.05),
+    "winglet up": feat_mod.BladeFeatures(tip="winglet"),
+    "winglet down + sweep": feat_mod.BladeFeatures(tip="winglet", winglet_dir="down", sweep_deg=20),
+    "raked tip": feat_mod.BladeFeatures(tip="raked"),
+    "all": feat_mod.BladeFeatures(sweep_deg=25, serration_depth=0.15, tubercle_amp=0.04, tip="winglet"),
+}
+for name, f in FEATS.items():
+    df = propgen.design(propgen.DesignSpec(**SPEC12, features=f))
+    m = propgen.build_mesh(df, "normal")
+    vf = propgen.verify(df)
+    e = vf["rel_error"]
+    D_all = float(np.hypot(m.vertices[:, 0], m.vertices[:, 1]).max() * 2)
+    swept_seen = any("swept blade" in n for n in vf["geometry_notes"])
+    check(m.is_watertight and m.metadata["single_solid"] and D_all <= 254 * 1.01 and abs(e["thrust_N"]) < 0.03
+          and abs(e["torque_Nm"]) < 0.03 and (swept_seen == f.swept) and abs(df.thrust_N / d0.thrust_N - 1) < 0.05
+          and all(t in df.notes for t in f.notes()),
+          f"{name}: {df.name} {df.thrust_N:.2f} N ({pct(df.thrust_N / d0.thrust_N - 1)} vs plain), one solid, "
+          f"overall {D_all:.1f} mm; round trip dT {pct(e['thrust_N'])} dQ {pct(e['torque_Nm'])}"
+          + (", sweep found by the slicer" if swept_seen else ""))
+    if name in ("serrations", "all") and not QUICK:
+        try:
+            import gmsh  # noqa: F401
+            path = os.path.join(TMP, f"feat_{name.replace(' ', '_')}.step")
+            info = propgen.export_step(df, path)
+            ck = info.get("check", {})
+            check(info["volumes"] == 1 and os.path.getsize(path) > 1e5 and not info.get("skipped")
+                  and ck.get("open_edges") == 0,
+                  f"{name}: STEP with every feature, one closed solid ({ck.get('open_edges')} open edges) in "
+                  f"{info['seconds']:.0f} s")
+        except ImportError:
+            pass
+# a fast prop: sweep lowers the effective Mach number, and the analyser applies the same model
+fast = dict(source="shaft", rpm=26000, shaft_power_W=2500, max_diameter_mm=260, max_tip_mach=1.1, aero="analytic")
+dfa = propgen.design(propgen.DesignSpec(**fast))
+dfs = propgen.design(propgen.DesignSpec(**fast, features=feat_mod.BladeFeatures(sweep_deg=40)))
+check(dfs.thrust_N > dfa.thrust_N and dfs.tip_mach > 0.95,
+      f"fixed 26000 rpm, tip Mach {dfs.tip_mach:.2f}: sweep 40 deg gives more thrust ({dfs.thrust_N:.2f} vs "
+      f"{dfa.thrust_N:.2f} N)")
+# serrated design: the analyser's --serrations reproduces the design's model on the plain mesh
+ds_ = propgen.design(propgen.DesignSpec(**SPEC12, features=FEATS["serrations"]))
+pth = os.path.join(TMP, "plain_serr.stl")
+propgen.build_mesh(ds_, "normal", details=False).export(pth)
+o1 = propsim.simulate([pth, "--rpm", f"{ds_.rpm}", "--aero", "neuralfoil"])
+o2 = propsim.simulate([pth, "--rpm", f"{ds_.rpm}", "--aero", "neuralfoil", "--serrations", "0.2,0.15"])
+check(o2.res.thrust < o1.res.thrust and abs(o2.res.thrust / ds_.thrust_N - 1) < 0.03,
+      f"propsim --serrations on the plain mesh: {o2.res.thrust:.2f} N (without {o1.res.thrust:.2f} N, design "
+      f"{ds_.thrust_N:.2f} N)")
+# single blade: material-neutral counterweight, 'printed' still accepted
+dm = propgen.design(propgen.DesignSpec(rpm=9000, shaft_power_W=300, source="shaft", max_diameter_mm=280, blades=1,
+                                       counterweight="printed", material_density=propgen.MATERIALS["POM / acetal"],
+                                       aero="analytic"))
+txt = propgen.summary_text(dm)
+check(dm.counterweight["kind"] == "solid" and "fully solid" in txt and "printed at" not in txt,
+      f"single blade in POM ({propgen.MATERIALS['POM / acetal']} g/cm3): solid counterweight {dm.counterweight['mass_g']:.1f} g, "
+      "no 3D-printing assumption in the text")
+for bad, kw in (("sweep 80", dict(sweep_deg=80)), ("serration depth 0.6", dict(serration_depth=0.6)),
+                ("tip 'fin'", dict(tip="fin"))):
+    try:
+        propgen.design(propgen.DesignSpec(**SPEC12, features=feat_mod.BladeFeatures(**kw)))
+        ok = False
+    except ValueError:
+        ok = True
+    check(ok, f"invalid feature refused: {bad}")
+
+# --------------------------------------------------------------------------- 13. strength
+print("\n13. Blade strength: material, process, safety factor")
+import structure   # noqa: E402
+# beam model against textbook cases: a uniform blade spinning (centrifugal stress rho w^2 (R^2 - r^2) / 2)
+# and a uniform cantilever under a uniform load at rest (tip deflection q L^4 / (8 E I))
+fam = propgen._shape("naca0012")
+xg = 0.5 * (1 - np.cos(np.linspace(0, np.pi, 81)))
+shp = (fam[0](np.sqrt(xg)), np.maximum(fam[1](np.sqrt(xg)), 0))
+rr_ = np.linspace(0.02, 0.15, 200)
+ones = np.ones_like(rr_)
+mat_ = structure.material_props("Aluminium 6061-T6", "CNC machined")
+cfr = structure.analyse(rr_, 0.02 * ones, 0.12 * ones, 0 * ones, 0 * ones, 0 * ones, 10000, mat_, shp, xg, 0.35,
+                        relief=False)
+om = 10000 * 2 * np.pi / 60
+exact = mat_["density"] * 1000 * om ** 2 * (0.15 ** 2 - 0.02 ** 2) / 2
+check(abs(cfr["sigma_cf"][0] / exact - 1) < 0.01,
+      f"uniform spinning blade: root centrifugal stress {cfr['sigma_cf'][0] / 1e6:.2f} MPa vs exact {exact / 1e6:.2f} MPa")
+q = 50.0
+bm = structure.analyse(rr_, 0.02 * ones, 0.12 * ones, 0 * ones, q * ones, 0 * ones, 0.0, mat_, shp, xg, 0.35,
+                       relief=False)
+P_, _x = structure.section_points(shp, xg, np.array([0.12]), np.array([0.02]), np.array([0.0]), 0.35)
+_, _, _, _, Iaa_, _ = structure.polygon_props(P_)
+wex = q * 0.13 ** 4 / (8 * mat_["E"] * Iaa_[0])
+check(abs(bm["tip_deflection"] / wex - 1) < 0.02,
+      f"uniform cantilever: tip deflection {bm['tip_deflection'] * 1e3:.3f} mm vs exact {wex * 1e3:.3f} mm")
+S12 = dict(kv=920, cells=4, motor_power_W=400, max_diameter_mm=254, blades=2)
+dr_ = propgen.design(propgen.DesignSpec(**S12, respect_strength=False))
+dd_ = propgen.design(propgen.DesignSpec(**S12))
+check(dd_.structure["ok"] and dd_.structure["sf_overall"] >= 2.0 and dr_.structure["sf_overall"] < dd_.structure["sf_overall"]
+      and any(n.startswith("sections thickened for strength") for n in dd_.notes)
+      and any(n.startswith("STRENGTH") for n in dr_.notes),
+      f"PLA, FDM: aerodynamic design SF {dr_.structure['sf_overall']:.2f} (flagged); designed within the limits "
+      f"SF {dd_.structure['sf_overall']:.2f}, {dd_.thrust_N:.2f} N vs {dr_.thrust_N:.2f} N, hub "
+      f"{dd_.hub_diameter_mm:.1f} x {dd_.hub_height_mm:.1f} mm")
+vd = propgen.verify(dd_)
+check(abs(vd["rel_error"]["thrust_N"]) < 0.02, f"thickened design round trip dT {pct(vd['rel_error']['thrust_N'])}")
+for mname, proc in (("Nylon PA6-GF30 (glass filled)", "Injection moulded"), ("Aluminium 7075-T6", "CNC machined"),
+                    ("Carbon fibre / epoxy", "Composite layup / moulding"),
+                    ("Titanium Ti-6Al-4V", "Metal print (SLM/DMLS)")):
+    dm_ = propgen.design(propgen.DesignSpec(**S12, material=mname, process=proc))
+    check(dm_.structure["ok"] and dm_.thrust_N >= dd_.thrust_N - 0.05,
+          f"{mname}, {proc.lower()}: SF {dm_.structure['sf_overall']:.2f}, {dm_.thrust_N:.2f} N, tip deflection "
+          f"{dm_.structure['tip_deflection'] * 1e3:.2f} mm")
+dx_ = propgen.design(propgen.DesignSpec(source="shaft", rpm=26000, shaft_power_W=2500, max_diameter_mm=260,
+                                        max_tip_mach=1.1, aero="analytic"))
+check(any(n.startswith("STRENGTH LIMIT NOT REACHABLE") for n in dx_.notes) and not dx_.structure["ok"],
+      f"PLA at 26000 rpm, 2.5 kW: limit not reachable, aerodynamic design shown and flagged "
+      f"(SF {dx_.structure['sf_overall']:.2f})")
+dw_ = propgen.design(propgen.DesignSpec(**S12, material="Beech wood", process="FDM 3D print"))
+check(any("not usually made by" in n for n in dw_.notes), "unusual material / process pair is flagged")
+try:
+    propgen.design(propgen.DesignSpec(**S12, material="Unobtainium"))
+    ok_ = False
+except ValueError:
+    ok_ = True
+check(ok_, "unknown material without strength data is refused")
+dc_ = propgen.design(propgen.DesignSpec(**S12, material="Custom", strength_mpa=200, modulus_gpa=20,
+                                        material_density=1.6, process="Injection moulded"))
+check(dc_.structure["mat"]["uts"] == 200e6 and dc_.spec.material_density == 1.6,
+      f"custom material (200 MPa, 20 GPa, 1.6 g/cm3): SF {dc_.structure['sf_overall']:.2f}")
+d1_ = propgen.design(propgen.DesignSpec(rpm=9000, shaft_power_W=300, source="shaft", max_diameter_mm=280, blades=1,
+                                        counterweight="steel", material="POM / acetal", process="Injection moulded",
+                                        aero="analytic"))
+check(d1_.counterweight.get("rod_pull_N", 0) > 10 and "rod alone" in propgen.summary_text(d1_),
+      f"single blade: the steel rod pulls {d1_.counterweight['rod_pull_N']:.0f} N at {d1_.rpm:.0f} rpm (reported)")
+# supplier catalogues: every listed material exists, has sane data, and its supplier process counts as usual
+import structure as _st
+bad = [(s, p, m) for s, sup in _st.SUPPLIERS.items() for p, ms in sup.items() for m in ms
+       if m not in _st.MATERIAL_DB or p not in _st.PROCESSES or p not in _st.MATERIAL_DB[m][5]]
+vals_ok = all(0.01 < v[0] < 9.5 and 0 < v[1] < 250 and 0 < v[2] < 2500 and 0 < v[3] <= 0.6
+              for v in _st.MATERIAL_DB.values())
+counts = {s: len(_st.supplier_materials(s)) for s in _st.SUPPLIER_NAMES}
+check(not bad and vals_ok and counts["JLC3DP"] >= 25 and counts["PCBWay"] >= 50 and counts["SendCutSend"] >= 40,
+      f"supplier catalogues: {counts} materials, {len(_st.MATERIAL_DB)} in all, data in range")
+for mname, proc in (("JLC3DP PA11-HP nylon (MJF)", _st.PBF), ("PCBWay Somos Taurus resin", _st.SLA),
+                    ("Stainless steel 316L (binder jet)", _st.BJ)):
+    dm_ = propgen.design(propgen.DesignSpec(**S12, material=mname, process=proc))
+    check(dm_.structure is not None and not any("not usually made by" in n for n in dm_.notes),
+          f"{mname}, {proc.lower()}: SF {dm_.structure['sf_overall']:.2f}, {dm_.thrust_N:.2f} N")
+ds_ = propgen.design(propgen.DesignSpec(**S12, material="Aluminium 5052-H32", process=_st.SHEET))
+check(any(n.startswith("sheet cutting makes flat parts only") for n in ds_.notes),
+      "sheet-cut process: the flat-parts-only warning is given")
+
+# --------------------------------------------------------------------------- 14. vibration
+print("\n14. Blade vibration: natural frequencies, rotation, resonance")
+# uniform cantilever (NACA 0012, 20 mm chord, 130 mm, aluminium, blade angle 0) against exact beam theory:
+# at rest f = lambda^2 / (2 pi L^2) sqrt(EI / m); spinning, the first flap mode follows Wright et al. (1982)
+rv_ = np.linspace(0.0, 0.13, 60)
+onev = np.ones_like(rv_)
+Pv, _x = structure.section_points(shp, xg, np.array([0.12]), np.array([0.02]), np.array([0.0]), 0.35)
+Av, _, _, Ittv, Iaav, _ = structure.polygon_props(Pv)
+mv = mat_["density"] * 1000 * Av[0]
+If, Il = min(Ittv[0], Iaav[0]), max(Ittv[0], Iaav[0])
+base_ = np.sqrt(mat_["E"] * If / (mv * 0.13 ** 4))
+v0 = structure.vibration(rv_, 0.02 * onev, 0.12 * onev, 0 * onev, 1.0, mat_, shp, xg, 0.35)
+f0 = {md["name"]: md["freq_design"] for md in v0["modes"]}
+ex1, ex2 = 1.87510 ** 2 * base_ / (2 * np.pi), 4.69409 ** 2 * base_ / (2 * np.pi)
+exl = 1.87510 ** 2 * np.sqrt(mat_["E"] * Il / (mv * 0.13 ** 4)) / (2 * np.pi)
+Jv = np.trapezoid((2 * shp[1]) ** 3, xg) / 3 * 0.12 ** 3 * 0.02 ** 4
+ext = np.sqrt(mat_["E"] / (2 * (1 + structure.NU)) * Jv / (mat_["density"] * 1000 * (Ittv[0] + Iaav[0]))) / (4 * 0.13)
+check(abs(f0["1. flap"] / ex1 - 1) < 0.005 and abs(f0["2. flap"] / ex2 - 1) < 0.005 and abs(f0["1. lag"] / exl - 1) < 0.005
+      and abs(f0["1. torsion"] / ext - 1) < 0.01,
+      f"cantilever at rest: flap {f0['1. flap']:.1f} / {f0['2. flap']:.1f} Hz (exact {ex1:.1f} / {ex2:.1f}), lag "
+      f"{f0['1. lag']:.1f} ({exl:.1f}), torsion {f0['1. torsion']:.0f} ({ext:.0f}) Hz")
+errs = []
+for g_, lam_ in ((2, 4.1373), (5, 6.4495), (10, 11.2023)):
+    rpm_ = g_ * base_ * 60 / (2 * np.pi)
+    vg = structure.vibration(rv_, 0.02 * onev, 0.12 * onev, 0 * onev, rpm_, mat_, shp, xg, 0.35)
+    errs.append(vg["modes"][0]["freq_design"] / (lam_ * base_ / (2 * np.pi)) - 1)
+check(max(abs(e) for e in errs) < 0.005, "spinning cantilever, 1st flap vs Wright et al. at 2, 5, 10 x the "
+      f"reference speed: errors {', '.join(pct(e) for e in errs)}")
+# a mode put right on 2P is flagged, and a design's report and notes carry the check
+rpm2 = f0["1. flap"] * 60 / 2
+for _ in range(8):      # the flap frequency rises with speed: find where it meets 2P
+    v2 = structure.vibration(rv_, 0.02 * onev, 0.12 * onev, 0 * onev, rpm2, mat_, shp, xg, 0.35, n_speeds=5)
+    rpm2 = v2["modes"][0]["freq_design"] * 60 / 2
+v2 = structure.vibration(rv_, 0.02 * onev, 0.12 * onev, 0 * onev, rpm2 * 0.97, mat_, shp, xg, 0.35)
+check(not v2["ok"] and any(m["nearest_order"] == 2 and m["kind"] == "flap" for m in v2["resonant"]),
+      f"flap mode near 2P is flagged ({v2['resonant'][0]['name'] if v2['resonant'] else '-'}, "
+      f"{100 * v2['resonant'][0]['margin'] if v2['resonant'] else 0:.0f} % away)")
+check(dd_.vibration is not None and "Vibration (blade clamped" in propgen.summary_text(dd_)
+      and (dd_.vibration["ok"] or any(n.startswith("RESONANCE") for n in dd_.notes)),
+      f"PLA design: {len(dd_.vibration['modes'])} modes, " + (
+          "no resonance" if dd_.vibration["ok"] else "RESONANCE flagged in the notes")
+      + f", 1st mode {dd_.vibration['modes'][0]['freq_design']:.0f} Hz = {dd_.vibration['modes'][0]['per_rev']:.2f}/rev")
+dcf_ = propgen.design(propgen.DesignSpec(**S12, material="Carbon fibre / epoxy", process="Composite layup / moulding"))
+check(dcf_.vibration["modes"][0]["freq_design"] > dd_.vibration["modes"][0]["freq_design"],
+      f"carbon blade is stiffer: 1st mode {dcf_.vibration['modes'][0]['freq_design']:.0f} Hz vs PLA "
+      f"{dd_.vibration['modes'][0]['freq_design']:.0f} Hz")
+
+# --------------------------------------------------------------------------- 15. CFD case: air model
+print("\n15. 3D CFD case writing: compressible / incompressible air")
+import cfd3d   # noqa: E402
+import propsim   # noqa: E402
+_o = propsim.simulate(["--test-prop", "--rpm", "8000"])
+cases = {}
+for air, rpm in (("auto", 8000), ("auto", 20000), ("compressible", 8000), ("incompressible", 20000)):
+    cd_ = os.path.join(TMP, f"cfd_{air}_{rpm}")
+    cases[(air, rpm)] = cfd3d.write_case(cd_, _o.mesh, _o.geom, cfd3d.CaseSettings(rpm=rpm, airspeed=0.0,
+                                                                                  resolution="coarse", air=air,
+                                                                                  flavor="esi", version="1912"))
+ok_ = (cases[("auto", 8000)]["solver"] == "simpleFoam" and cases[("auto", 20000)]["solver"] == "rhoSimpleFoam"
+       and cases[("compressible", 8000)]["solver"] == "rhoSimpleFoam"
+       and cases[("incompressible", 20000)]["solver"] == "simpleFoam")
+cc_ = cases[("auto", 20000)]["case_dir"]
+files_ok = all(os.path.exists(os.path.join(cc_, *f)) for f in (("constant", "thermophysicalProperties"),
+                                                               ("0.orig", "T"), ("0.orig", "alphat")))
+pinf = cases[("auto", 20000)]["p_inf"]
+rho_back = pinf / (cfd3d.R_AIR * cases[("auto", 20000)]["T_inf"])
+check(ok_ and files_ok and abs(rho_back / 1.225 - 1) < 1e-9 and 'SOLVER="rhoSimpleFoam"' in open(os.path.join(cc_, "Allrun")).read(),
+      f"auto picks rhoSimpleFoam above tip Mach {cfd3d.COMPRESSIBLE_AUTO_MACH:g} (8000 rpm: tip Mach "
+      f"{cases[('auto', 8000)]['tip_mach']:.2f} -> simpleFoam; 20000 rpm: {cases[('auto', 20000)]['tip_mach']:.2f} -> "
+      f"rhoSimpleFoam); ambient p {pinf:.0f} Pa, T {cases[('auto', 20000)]['T_inf']:.2f} K gives rho 1.225")
+
+# --------------------------------------------------------------------------- 16. hub options, STEP fidelity
+print("\n16. Hub options; STL and STEP with every detail")
+import hubgeom   # noqa: E402
+HUB = hubgeom.HubOptions(edge="round", edge_mm=1.5, spinner="ogive", spinner_pocket_mm=8, holes=4, hole_mm=3.2,
+                         hole_circle_mm=16, hole_head="counterbore", head_mm=6, head_depth_mm=2, dflat_mm=0.5,
+                         set_screw_mm=2.5, bore_tolerance_mm=0.1, fillet_mm=2.0, blade_offset_mm=1.0)
+dh_ = propgen.design(propgen.DesignSpec(**S12, aero="analytic", hub=HUB,
+                                        features=feat_mod.BladeFeatures(tubercle_amp=0.05, serration_depth=0.15)))
+mh_ = propgen.build_mesh(dh_)
+m0_ = propgen.build_mesh(propgen.design(propgen.DesignSpec(**S12, aero="analytic")))
+vh_ = propgen.verify(dh_)
+eh = vh_["rel_error"]
+check(mh_.is_watertight and mh_.metadata["single_solid"] and dh_.hub_diameter_mm >= HUB.min_diameter_mm(5.0) - 1e-6
+      and abs(eh["thrust_N"]) < 0.02 and "hub options:" in propgen.summary_text(dh_),
+      f"all hub options + tubercles + teeth: one watertight solid ({len(mh_.faces)} triangles), hub "
+      f"{dh_.hub_diameter_mm:.1f} x {dh_.hub_height_mm:.1f} mm (grown to hold the holes and the fillet); "
+      f"round trip dT {pct(eh['thrust_N'])}")
+# the slicer still finds the blades and the axis with mounting holes in the hub (not taken for the bore)
+pth = os.path.join(TMP, "hub_full.stl")
+mh_.export(pth)
+try:
+    oh = propsim.simulate([pth, "--units", "mm", "--axis", "z", "--rpm", f"{dh_.rpm:.1f}", "--aero", "analytic",
+                           "--blades", "2"])
+    ok_ = abs(oh.geom.radius * 2e3 / dh_.diameter_mm - 1) < 0.01
+except Exception as exc:  # noqa: BLE001
+    ok_, oh = False, None
+    print("      ", exc)
+check(ok_, "PropSim analyses the full STL with mounting holes, pocket and set screw in the hub")
+o_, n_ = hubgeom.HubOptions(holes=4, hole_circle_mm=30).check(20.0, 10.0, 5.0, 2)
+check(o_.holes == 0 and any(x.startswith("HUB:") and "need a hub of at least" in x for x in n_),
+      "mounting holes that do not fit are left out, with a note")
+# a hub diameter set by hand that holds the holes with a thin wall: the holes are kept, cut after the blades are
+# joined (they come closer to the edge than the blade roots reach into the hub)
+HO = hubgeom.HubOptions(holes=4, hole_mm=3.2, hole_circle_mm=16)
+ds_ = propgen.design(propgen.DesignSpec(**S12, aero="analytic", hub_diameter_mm=22, hub=HO))
+ms_ = propgen.build_mesh(ds_)
+ok_ = ds_.profile["hub"].holes == 4 and hubgeom.cuts_reach_blades(ds_.profile["hub"], 11.0, ds_.bore_mm) \
+    and ms_.is_watertight and not any(n.startswith("HUB") for n in ds_.notes)
+line = f"set 22 mm hub with 4 x 3.2 mm holes on 16 mm: kept, STL watertight"
+if not QUICK:
+    try:
+        import gmsh  # noqa: F401
+        info = propgen.export_step(ds_, os.path.join(TMP, "hub22.step"))
+        ck = info["check"]
+        ok_ = ok_ and info["volumes"] == 1 and ck["open_edges"] == 0 and abs(ck["volume_occ_mm3"] / ms_.volume - 1) < 0.01
+        line += f"; STEP 1 solid, volume {pct(ck['volume_occ_mm3'] / ms_.volume - 1)} vs the STL"
+    except ImportError:
+        pass
+check(ok_, line)
+# blind bore from the motor side, with the set screw moved into it; a rotated bolt circle
+db_ = propgen.design(propgen.DesignSpec(**S12, aero="analytic", hub_height_mm=30,
+                                        hub=hubgeom.HubOptions(bore_depth_mm=8, set_screw_mm=3, holes=4,
+                                                               hole_angle_deg=10)))
+mb_ = propgen.build_mesh(db_)
+hb_ = db_.profile["hub"]
+zs = np.array([-13.0, -10.0, -5.0, 0.0, 10.0])
+inside = mb_.contains(np.column_stack([np.zeros(5), np.zeros(5), zs]))
+sec = mb_.section(plane_origin=[0, 0, 0], plane_normal=[0, 0, 1])
+angs = sorted(round(float(np.degrees(np.arctan2(e.mean(axis=0)[1], e.mean(axis=0)[0])) % 360), 1)
+              for e in sec.discrete if 6 < np.hypot(*e.mean(axis=0)[:2]) < 10)
+check(mb_.is_watertight and list(inside) == [False, False, True, True, True] and hb_.set_screw_mm == 3
+      and abs(hb_.screw_z(db_.hub_diameter_mm / 2, 30) + 11) < 1e-6 and len(angs) == 4
+      and np.allclose(angs, [10, 100, 190, 280], atol=1.5),
+      f"8 mm blind bore from the motor side (set screw moved into it), bolt circle rotated 10 deg: holes at {angs}")
+if not QUICK:
+    try:
+        import gmsh  # noqa: F401
+        for mode in ("exact", "smooth"):
+            path = os.path.join(TMP, f"hub_{mode}.step")
+            info = propgen.export_step(dh_, path, mode=mode)
+            ck = info["check"]
+            vol = ck.get("volume_occ_mm3", 0)
+            check(info["volumes"] == 1 and ck["open_edges"] == 0 and abs(vol / mh_.volume - 1) < 0.03,
+                  f"STEP {mode}: one closed solid (0 open edges), every feature and hub option, volume "
+                  f"{pct(vol / mh_.volume - 1)} vs the STL, {os.path.getsize(path) / 1e6:.1f} MB in "
+                  f"{info['seconds']:.0f} s")
+    except ImportError:
+        pass
 
 # --------------------------------------------------------------------------- CLI
 print("\n8. Command line")
@@ -416,6 +744,39 @@ cli = subprocess.run([sys.executable, os.path.join(HERE, "propgen.py"), "--rpm",
 check(cli.returncode == 0 and "brass rod" in cli.stdout
       and json.load(open(os.path.join(TMP, "cli1.json")))["counterweight"]["kind"] == "brass",
       "CLI --blades 1 --counterweight brass (summary and JSON carry the counterweight)")
+
+cli = subprocess.run([sys.executable, os.path.join(HERE, "propgen.py"), "--kv", "920", "--cells", "4",
+                      "--motor-power", "400", "--max-diameter", "10", "--units", "in", "--pitch", "6",
+                      "--pitch-mode", "constant", "--blade-sweep", "20", "--serrations", "0.15,0.15", "--winglet",
+                      "0.07,80,up", "--json", os.path.join(TMP, "cli2.json")], capture_output=True, text=True)
+j2 = json.load(open(os.path.join(TMP, "cli2.json"))) if cli.returncode == 0 else {}
+check(cli.returncode == 0 and "pitch set to" in cli.stdout and "feature: sweep" in cli.stdout
+      and j2.get("features", {}).get("tip") == "winglet" and abs(j2["pitch75_mm"] / 152.4 - 1) < 0.01,
+      "CLI --pitch --pitch-mode --blade-sweep --serrations --winglet (summary and JSON carry them)")
+if cli.returncode:
+    print(cli.stderr[-2000:])
+
+cli = subprocess.run([sys.executable, os.path.join(HERE, "propgen.py"), "--kv", "920", "--cells", "4",
+                      "--motor-power", "400", "--max-diameter", "254", "--material", "Nylon PA6-GF30 (glass filled)",
+                      "--process", "Injection moulded", "--safety-factor", "2.5", "--json", os.path.join(TMP, "cli3.json")],
+                     capture_output=True, text=True)
+j3 = json.load(open(os.path.join(TMP, "cli3.json"))) if cli.returncode == 0 else {}
+check(cli.returncode == 0 and "Strength (Nylon PA6-GF30" in cli.stdout and j3.get("structure", {}).get("safety_factor") == 2.5
+      and "Vibration (blade clamped" in cli.stdout and j3.get("vibration", {}).get("modes"),
+      "CLI --material --process --safety-factor (summary and JSON carry the strength check)")
+cli = subprocess.run([sys.executable, os.path.join(HERE, "propgen.py"), "--list-materials"], capture_output=True, text=True)
+check(cli.returncode == 0 and "Aluminium 7075-T6" in cli.stdout and "Injection moulded" in cli.stdout, "CLI --list-materials")
+cli = subprocess.run([sys.executable, os.path.join(HERE, "propgen.py"), "--kv", "920", "--cells", "4",
+                      "--motor-power", "400", "--max-diameter", "254", "--aero", "analytic", "--spinner", "dome",
+                      "--mount-holes", "4", "--mount-circle", "12", "--mount-angle", "20", "--root-fillet", "1.5", "--set-screw", "2.5", "--bore-depth", "8",
+                      "--stl", os.path.join(TMP, "cli4.stl"), "--json", os.path.join(TMP, "cli4.json")],
+                     capture_output=True, text=True)
+j4 = json.load(open(os.path.join(TMP, "cli4.json"))) if cli.returncode == 0 else {}
+check(cli.returncode == 0 and "hub options:" in cli.stdout and j4.get("hub_options", {}).get("spinner") == "dome"
+      and j4["hub_options"].get("bore_depth_mm") == 8 and j4["hub_options"].get("hole_angle_deg") == 20
+      and "one watertight solid" in cli.stdout, "CLI hub options (--spinner --mount-holes --mount-angle --root-fillet --set-screw --bore-depth)")
+if cli.returncode:
+    print(cli.stderr[-2000:])
 
 print("\n" + ("ALL CHECKS PASSED" if not FAIL else f"{len(FAIL)} CHECK(S) FAILED:\n  - " + "\n  - ".join(FAIL)))
 print(f"(temporary files in {TMP})")

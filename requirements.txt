@@ -2,6 +2,7 @@ numpy
 scipy
 trimesh
 manifold3d     # mesh booleans: generated props as one solid (counterweight, rod hole)
+threadpoolctl  # optional: keeps the resonance check fast while other work loads the CPU
 # optional, for reading STEP files directly:
 # gmsh
 # for the desktop app (propsim_gui.py):

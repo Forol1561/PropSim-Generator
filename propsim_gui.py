@@ -3563,7 +3563,7 @@ class App:
                            gen_dmax="254", gen_dfix="", gen_mach="0.6",
                            gen_airfoil=next(iter(self.gen_airfoils)), gen_spin="CCW", gen_bore="5",
                            gen_hub="", gen_hub_h="", gen_edge="Sharp", gen_edge_mm="1", gen_spinner="None",
-                           gen_spinner_len="", gen_pocket="", gen_tol="0", gen_dflat="", gen_setscrew="",
+                           gen_spinner_len="", gen_pocket="", gen_tol="0", gen_bore_dep="", gen_hang="", gen_dflat="", gen_setscrew="",
                            gen_hex="", gen_hex_d="3", gen_holes="", gen_hole_d="3.2", gen_pcd="16",
                            gen_head="None", gen_head_d="6", gen_head_dep="3", gen_fillet="", gen_offset="0",
                            gen_step="Exact").items():
@@ -3653,7 +3653,9 @@ class App:
                  "engineering estimate). Above 1 the tips are supersonic: experimental, extremely loud; use "
                  "the Experimental (high speed) airfoils. Blade sweep (below) delays the transonic drag rise."),
                 ("gen_bore", "Shaft bore", "mm", "Hole through the hub for the motor shaft or prop adapter."),
-                ("gen_hub", "Hub diameter", "mm · auto", "Blank = sized from the bore and the diameter."),
+                ("gen_hub", "Hub diameter", "mm · auto", "Blank = sized from the bore and the diameter (and big "
+                 "enough for the mounting holes or hex pocket). A set diameter is used as is: holes that do not fit "
+                 "it are left out, with a HUB note."),
                 ("airspeed", "Airspeed", "m/s", "Design airspeed (forward flight); 0 = static thrust (hover). "
                  "The same setting as card 04 on the left: changing one changes both."),
                 ("rho", "Air density", "kg/m³", "1.225 at sea level, ~1.11 at 1000 m, ~1.0 at 2000 m. The same "
@@ -3731,6 +3733,9 @@ class App:
              "of the shaft or a prop nut (the bore then continues into it).", "spinner")
         hrow("gen_tol", "Bore tolerance", "mm", "Added to the shaft bore: + for a clearance fit (FDM holes "
              "print about 0.1-0.3 mm small), - for a press fit.")
+        hrow("gen_bore_dep", "Bore depth", "mm · through", "Blank = the bore goes all the way through. A depth "
+             "makes a blind bore from the bottom (the motor side), e.g. 40 for a shaft that should not come out at "
+             "the front. The D-flat follows it, and the set screw moves to the middle of a short bore.")
         hrow("gen_dflat", "D-flat", "mm · none", "Depth of a flat on the bore for a D-shaft (0.5 on a 5 mm "
              "shaft is common). It faces the set screw.")
         hrow("gen_setscrew", "Set screw", "mm · none", "Diameter of a radial hole at mid-height, between two "
@@ -3740,10 +3745,14 @@ class App:
         hrow("gen_hex_d", "Pocket depth", "mm", "Depth of the hex pocket.", "hex")
         hrow("gen_holes", "Mount holes", "· none", "Number of mounting holes on a bolt circle (e.g. 4 for "
              "motors with a threaded bell and no shaft). With a spinner they go on through it, wide enough "
-             "for the screw heads.")
+             "for the screw heads. An auto hub grows to hold them; a hub diameter you set must be at least "
+             "the bolt circle + the hole (or head recess) + 2 mm, or they are left out with a HUB note.")
         hrow("gen_hole_d", "Hole size", "mm", "Hole diameter (3.2 = M3 clearance, 2.2 = M2).", "holes")
         hrow("gen_pcd", "Bolt circle", "mm", "Diameter of the circle through the hole centres (motors: 12, 16, "
              "19 mm are common).", "holes")
+        hrow("gen_hang", "Bolt angle", "° · auto", "Rotates the bolt circle: the angle of the first hole from "
+             "blade 1, counter-clockwise seen from the front (for a CW prop, mirrored with the prop). Blank = half "
+             "the hole spacing from the blade (4 holes: 45°, 3 holes: 60°, 2 holes: 90°).", "holes")
         hseg("gen_head", "Screw heads", ["None", "Countersink", "Counterbore"], "A recess on the front for "
              "the screw heads.", "holes")
         hrow("gen_head_d", "Head size", "mm", "Diameter of the head recess.", "head")
@@ -4195,9 +4204,11 @@ class App:
                 spinner_pocket_mm=n("gen_pocket", "Spinner pocket", hi=200),
                 holes=holes, hole_mm=n("gen_hole_d", "Hole size", lo=0.3, hi=50, default=3.2),
                 hole_circle_mm=n("gen_pcd", "Bolt circle", lo=1, hi=500, default=16.0),
+                hole_angle_deg=self._num("gen_hang", "Bolt angle", lo=-360, hi=360),
                 hole_head=self.v["gen_head"].get().lower(), head_mm=n("gen_head_d", "Head size", hi=60, default=6.0),
                 head_depth_mm=n("gen_head_dep", "Head depth", hi=100, default=3.0),
                 bore_tolerance_mm=n("gen_tol", "Bore tolerance", lo=-2, hi=2),
+                bore_depth_mm=n("gen_bore_dep", "Bore depth", hi=1000),
                 dflat_mm=n("gen_dflat", "D-flat", hi=50), set_screw_mm=n("gen_setscrew", "Set screw", hi=30),
                 nut_hex_mm=n("gen_hex", "Nut pocket", hi=100), nut_depth_mm=n("gen_hex_d", "Pocket depth", hi=100,
                                                                              default=3.0),

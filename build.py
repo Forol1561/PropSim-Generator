@@ -33,6 +33,10 @@ args = [
     "--hidden-import", "cfd3d",             # imported lazily (3D CFD tab)
     "--hidden-import", "propgen",           # imported lazily (Propeller Generation tab)
     "--hidden-import", "airfoil_db",        # propgen's airfoil library
+    "--hidden-import", "features",          # experimental blade features (propgen / propsim)
+    "--hidden-import", "structure",         # blade strength (propgen)
+    "--hidden-import", "hubgeom",           # hub options and hub solids (propgen)
+    "--hidden-import", "threadpoolctl",     # one BLAS thread for the small vibration eigenproblems
     "--hidden-import", "manifold3d",        # trimesh booleans (one-solid prop meshes, counterweight)
     "--exclude-module", "matplotlib",
     "--exclude-module", "IPython",
