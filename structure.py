@@ -16,7 +16,7 @@ each station's chord, thickness and blade angle). Per station, from the tip inwa
 - von Mises stress, a static safety factor against the process-corrected tensile strength, and a
   fatigue safety factor (Goodman, an alternating load of `alt_load` x the aerodynamic bending,
   against the process-corrected fatigue strength at about 10^7 cycles);
-- stress concentrations: the blade-to-hub junction (Kt 1.5 at the root, no fillet in the model),
+- stress concentrations: the blade-to-hub junction (Kt 1.5 at a sharp root, less with a fillet),
   the tooth roots of a serrated trailing edge (Kt 2.0 on the trailing-edge fibres), the troughs of
   leading-edge tubercles (smaller section there);
 - the hub ring around the shaft bore, which carries each blade's root pull (Kt 2 at the bore);
@@ -383,7 +383,7 @@ def _outboard(r, f):
 def analyse(r, chord, tc, beta, f_axial, f_tang, rpm, mat, family_shape, x_grid, x_stack, *,
             t_offset=None, camber=0.03, rho_air=1.225, W=None, cl=None, hub_radius=None, bore_radius=None,
             hub_height=None, blades=2, alt_load=0.3, safety_factor=2.0, fatigue=True, features=None,
-            tip_mass=0.0, tip_mass_radius=None, relief=True) -> dict:
+            tip_mass=0.0, tip_mass_radius=None, relief=True, root_fillet=0.0) -> dict:
     """Stresses along one blade. Lengths m, forces per unit span per blade N/m (f_axial along the
     thrust, f_tang along the direction of travel: the drag/torque force is negative), rpm, mat from
     material_props. t_offset: the stacking line's displacement along the direction of travel (sweep),
@@ -462,7 +462,11 @@ def analyse(r, chord, tc, beta, f_axial, f_tang, rpm, mat, family_shape, x_grid,
     kt = np.ones((n, len(xs)))
     x_r = r / r[-1]
     root_zone = np.clip(1 - (r - r[0]) / max(0.05 * r[-1], 1e-6), 0, 1)
-    kt *= 1 + (KT_ROOT - 1) * root_zone[:, None]
+    # the root junction: Kt 1.5 when sharp, less with a fillet (notch radius root_fillet [m] against the
+    # root section's thickness; a fillet as big as the thickness takes it to ~1.17)
+    t_root = max(float(np.asarray(tc)[0] * np.asarray(chord)[0]), 1e-6)
+    kt_root = 1 + (KT_ROOT - 1) / (1 + 2 * max(root_fillet, 0.0) / t_root)
+    kt *= 1 + (kt_root - 1) * root_zone[:, None]
     tub_factor = np.ones(n)
     if features is not None:
         if features.serrated:
@@ -521,6 +525,12 @@ def analyse(r, chord, tc, beta, f_axial, f_tang, rpm, mat, family_shape, x_grid,
         tip_deflection=float(w_a[-1]), tip_deflection_inplane=float(w_t[-1]), tip_twist=float(np.degrees(twist[-1])),
         root_pull=float(N[0]), hub=hub, mat=mat, safety_factor=safety_factor, alt_load=alt_load, fatigue=fatigue,
         omega=omega, mass_blade=float(np.trapezoid(dm, r)), q_ctm=q_ctm,
+        # the full field, for the 3D view: section outlines in the (t, a) plane around the stacking axis
+        # (t_offset not included), stress at every outline point, deflection and elastic twist per station
+        points=P, xs=xs, t_offset=np.asarray(t_offset, float), chord=np.asarray(chord, float),
+        beta=np.asarray(beta, float), tc=np.asarray(tc, float), sigma_points=sig,
+        sigma_bend_points=sig_b * kt * tub_factor[:, None], sigma_bend_max=np.abs(sig_b * kt * tub_factor[:, None]).max(axis=1),
+        deflection_t=w_t, deflection_a=w_a, twist=twist, torque_twist=Tq, kt_root=kt_root,
     )
     sfs = [out["sf_min"]] + ([hub["sf"]] if hub else [])
     out["sf_overall"] = float(min(sfs))
@@ -545,6 +555,46 @@ def thickness_scale_needed(res, safety_factor, k_max):
         hi = np.where(ok, mid, hi)
         lo = np.where(ok, lo, mid)
     k = np.where(need, hi, 1.0)
+    return k
+
+
+def thickness_scale_tapered(res, safety_factor, k_cap=None):
+    """Per station, the factor on t/c (chord kept) that brings the safety factor to the target, marching
+    in from the tip so each station's centrifugal pull includes the extra mass of the sections outboard
+    of it at their own factors. Unlike thickness_scale_needed (each station on its own), this gives a
+    fully stressed, tapered blade: where the stress is mostly centrifugal, thickening every section by
+    the same factor cannot help (the pull grows with the area), thickening the inner ones more does.
+    k_cap: the largest factor per station (thickness limits). Only an estimate: the caller iterates."""
+    r = np.asarray(res["r"], float)
+    n = len(r)
+    N = np.asarray(res["N"], float)
+    s_cf = np.asarray(res["sigma_cf"], float)
+    s_b = np.maximum(np.asarray(res["sigma_max"], float) - s_cf, 0.0)
+    sf = np.asarray(res["sf"], float)
+    cap = np.full(n, 3.0) if k_cap is None else np.maximum(np.asarray(k_cap, float), 1.0)
+    target = safety_factor * 1.05
+    dseg = np.maximum(N[:-1] - N[1:], 0.0)        # each segment's own pull (trapezoid of its two ends)
+    k = np.ones(n)
+    Nn = np.zeros(n)
+    for i in range(n - 1, -1, -1):
+        base = N[-1] if i == n - 1 else Nn[i + 1] + 0.5 * dseg[i] * k[i + 1]
+        half = 0.0 if i == n - 1 else 0.5 * dseg[i]
+
+        def sf_at(kk):
+            pull = (base + half * kk) / max(N[i], 1e-12)
+            return sf[i] * (s_cf[i] + s_b[i]) / max(s_cf[i] * pull / kk + s_b[i] / kk ** 2, 1.0)
+        if sf_at(1.0) >= target:
+            kk = 1.0
+        elif sf_at(cap[i]) < target:
+            kk = cap[i]
+        else:
+            lo, hi = 1.0, cap[i]
+            for _ in range(30):
+                mid = 0.5 * (lo + hi)
+                lo, hi = (lo, mid) if sf_at(mid) >= target else (mid, hi)
+            kk = hi
+        k[i] = kk
+        Nn[i] = base + half * kk
     return k
 
 
@@ -713,15 +763,32 @@ def _vibration(r, chord, tc, beta, rpm, mat, family_shape, x_grid, x_stack, *, n
         tors.append(np.sqrt(np.maximum(lt, 0)) / (2 * np.pi))
     # modes tracked by index (sorted frequency); the type label from the design speed
     i_d = int(np.argmin(np.abs(speeds - om_d)))
+    # mode shapes at the design speed (unit peak deflection; torsion: unit peak twist [rad])
+    om = speeds[i_d]
+    _, vec_b = eigh(K + om ** 2 * (KgN - Ms), M, subset_by_index=[0, n_modes - 1])
+    _, vec_t = eigh(Kt + om ** 2 * Kc, Mt, subset_by_index=[0, 1])
+    shapes_b, shapes_t = [], []
+    for i in range(n_modes):
+        full = np.zeros(4 * n)
+        full[free] = vec_b[:, i]
+        wt, wa = full[0::4], full[2::4]
+        k = max(np.abs(wt).max(), np.abs(wa).max(), 1e-30)
+        sgn = 1.0 if (wt[-1] + wa[-1]) >= 0 else -1.0
+        shapes_b.append(dict(t=sgn * wt / k, a=sgn * wa / k, theta=np.zeros(n)))
+    for i in range(2):
+        th = np.concatenate([[0.0], vec_t[:, i]])
+        k = max(np.abs(th).max(), 1e-30)
+        shapes_t.append(dict(t=np.zeros(n), a=np.zeros(n), theta=(1.0 if th[-1] >= 0 else -1.0) * th / k))
     modes = []
     counts = {}
     for i in range(n_modes):
         kind = bend[i_d][1][i]
         counts[kind] = counts.get(kind, 0) + 1
         modes.append(dict(name=f"{counts[kind]}. {kind}", kind=kind,
-                          freq=np.array([b[0][i] for b in bend])))
+                          freq=np.array([b[0][i] for b in bend]), shape=shapes_b[i]))
     for i in range(2):
-        modes.append(dict(name=f"{i + 1}. torsion", kind="torsion", freq=np.array([t[i] for t in tors])))
+        modes.append(dict(name=f"{i + 1}. torsion", kind="torsion", freq=np.array([t[i] for t in tors]),
+                          shape=shapes_t[i]))
     f_rot = om_d / (2 * np.pi)
     warnings, crossings = [], []
     for md in modes:
@@ -741,7 +808,7 @@ def _vibration(r, chord, tc, beta, rpm, mat, family_shape, x_grid, x_stack, *, n
                 if d[j] > 0 >= d[j + 1] or d[j] < 0 <= d[j + 1]:
                     s = speeds[j] + (speeds[j + 1] - speeds[j]) * d[j] / (d[j] - d[j + 1])
                     crossings.append(dict(mode=md["name"], order=kk, rpm=float(s * 60 / (2 * np.pi))))
-    return dict(rpm=rpm, f_rot=f_rot, speeds_rpm=speeds * 60 / (2 * np.pi), modes=modes, crossings=crossings,
+    return dict(rpm=rpm, f_rot=f_rot, speeds_rpm=speeds * 60 / (2 * np.pi), modes=modes, crossings=crossings, r=r,
                 resonant=warnings, ok=not warnings, margin_req=RES_MARGIN, orders=RES_ORDERS)
 
 

@@ -23,6 +23,7 @@ import numpy as np
 EDGES = ("sharp", "chamfer", "round")
 SPINNERS = ("none", "cone", "dome", "ogive")
 HEADS = ("none", "countersink", "counterbore")
+FILLET_SHAPES = ("round", "chamfer")
 
 
 @dataclass
@@ -47,11 +48,16 @@ class HubOptions:
     set_screw_mm: float = 0.0           # radial set-screw hole diameter, at mid-height (0 = none)
     nut_hex_mm: float = 0.0             # across-flats of a hex pocket for a prop nut in the front face
     nut_depth_mm: float = 3.0
-    fillet_mm: float = 0.0              # blade-root fillet radius (0 = sharp junction)
+    fillet_mm: float = 0.0              # blade-root fillet size: how far it reaches out from the blade at the
+    #                                     hub surface (0 = sharp junction)
+    fillet_shape: str = "round"         # "round" (concave quarter circle / ellipse) or "chamfer" (straight)
+    fillet_length_mm: float | None = None   # how far up the blade it runs; None = the size (a quarter
+    #                                     circle); longer = a gentler elliptic blend
     blade_offset_mm: float = 0.0        # blades moved along the axis (+ = towards the thrust side)
 
     def __post_init__(self):
-        for name, allowed in (("edge", EDGES), ("spinner", SPINNERS), ("hole_head", HEADS)):
+        for name, allowed in (("edge", EDGES), ("spinner", SPINNERS), ("hole_head", HEADS),
+                              ("fillet_shape", FILLET_SHAPES)):
             v = str(getattr(self, name)).lower()
             if v not in allowed:
                 raise ValueError(f"hub {name.replace('_', ' ')} must be one of {', '.join(allowed)}")
@@ -64,6 +70,31 @@ class HubOptions:
             raise ValueError("hub holes must be 0 to 12")
         if self.spinner_length_mm is not None and self.spinner_length_mm <= 0:
             self.spinner_length_mm = None
+        if self.fillet_length_mm is not None and self.fillet_length_mm <= 0:
+            self.fillet_length_mm = None
+
+    def fillet_length(self):
+        """How far the fillet runs up the blade [mm]."""
+        return self.fillet_length_mm if self.fillet_length_mm else self.fillet_mm
+
+    def fillet_offset(self, x):
+        """Outward offset [mm] of the blade outline at distance x [mm] from the hub surface."""
+        f, L = self.fillet_mm, self.fillet_length()
+        if f <= 0 or L <= 0:
+            return 0.0 * np.asarray(x, float)
+        s = np.clip(1 - np.asarray(x, float) / L, 0.0, 1.0)      # 1 at the hub, 0 where it ends
+        if self.fillet_shape == "chamfer":
+            return f * s
+        return f * (1 - np.sqrt(np.maximum(1 - s * s, 0.0)))
+
+    def fillet_radius(self):
+        """Effective notch radius of the fillet [mm] for the root's stress concentration (0 = sharp)."""
+        f, L = self.fillet_mm, self.fillet_length()
+        if f <= 0:
+            return 0.0
+        if self.fillet_shape == "chamfer":
+            return 0.3 * min(f, L)          # two blunt corners instead of one sharp one
+        return math.sqrt(f * L)
 
     @property
     def any(self) -> bool:
@@ -220,7 +251,9 @@ class HubOptions:
         if self.nut_hex_mm:
             bits.append(f"hex pocket {self.nut_hex_mm:g} mm AF x {self.nut_depth_mm:g} mm")
         if self.fillet_mm:
-            bits.append(f"root fillet {self.fillet_mm:g} mm")
+            bits.append(f"root fillet {self.fillet_mm:g} mm" + (f" x {self.fillet_length():g} mm up the blade"
+                                                               if self.fillet_length_mm else "")
+                        + (" (chamfer)" if self.fillet_shape == "chamfer" else ""))
         if self.blade_offset_mm:
             bits.append(f"blades {self.blade_offset_mm:+g} mm along the axis")
         return ", ".join(bits)
@@ -280,12 +313,15 @@ def profile(o: HubOptions, rh, h, n_round=10, n_spin=40):
     if L > 0:
         u = np.linspace(0, 1, n_spin)[1:-1]
         if o.spinner == "cone":
-            # straight cone with a small rounded nose
-            r = rh * (1 - u)
-            rn = 0.08 * rh
-            nose = u > 1 - rn / rh * 2
-            r = np.where(nose, np.minimum(r, rn * np.sqrt(np.maximum(1 - ((u - (1 - 2 * rn / rh)) / (2 * rn / rh)) ** 2,
-                                                                     0))), r)
+            # a straight cone with a spherical nose tangent to it (no step where the nose starts)
+            for ri, zi in cone_nose_points(rh, zt, L, n_spin):
+                pts.append((ri, zi))
+            pts.append((0.0, pts[-1][1]))
+            out = [pts[0]]
+            for p in pts[1:]:
+                if abs(p[0] - out[-1][0]) > 1e-9 or abs(p[1] - out[-1][1]) > 1e-9:
+                    out.append(p)
+            return np.array(out)
         elif o.spinner == "dome":
             r = rh * np.sqrt(np.maximum(1 - u ** 2, 0))
         else:  # ogive: pointed, tangent to the hub at its base
@@ -305,6 +341,28 @@ def profile(o: HubOptions, rh, h, n_round=10, n_spin=40):
         if abs(p[0] - out[-1][0]) > 1e-9 or abs(p[1] - out[-1][1]) > 1e-9:
             out.append(p)
     return np.array(out)
+
+
+def cone_geometry(rh, zt, L):
+    """Cone spinner: (tangent point (r, z), nose centre z, nose radius, nose-flat point (r, z), half angle).
+    The nose sphere (radius 0.12 x hub radius, at most a third of the cone's slant) is tangent to the cone
+    line from (rh, zt) to the apex (0, zt + L); it ends in a tiny flat (a pole is a degenerate STEP edge)."""
+    a = math.atan2(rh, L)                         # half angle
+    rn = min(0.12 * rh, 0.33 * rh / math.cos(a))
+    zc = zt + L - rn / math.sin(a)                # sphere centre on the axis
+    tan_pt = (rn * math.cos(a), zc + rn * math.sin(a))
+    r_tip = min(max(0.3, 0.02 * rh), 0.5 * rn * math.cos(a))
+    flat = (r_tip, zc + math.sqrt(max(rn * rn - r_tip * r_tip, 0.0)))
+    return tan_pt, zc, rn, flat, a
+
+
+def cone_nose_points(rh, zt, L, n=40):
+    """(r, z) points of the cone spinner outline after its base (rh, zt), ending at the nose flat."""
+    (rt, zt_), zc, rn, (rf, zf), a = cone_geometry(rh, zt, L)
+    pts = [(rh * (1 - u) + rt * u, zt * (1 - u) + zt_ * u) for u in np.linspace(0, 1, max(n // 2, 4))[1:]]
+    th0, th1 = math.atan2(zt_ - zc, rt), math.atan2(zf - zc, rf)
+    pts += [(rn * math.cos(t), zc + rn * math.sin(t)) for t in np.linspace(th0, th1, max(n // 2, 4))[1:]]
+    return pts
 
 
 def hexagon(af):
@@ -421,7 +479,17 @@ def hub_occ(occ, o: HubOptions, rh, h):
         a = pt(rh, zt)
         curves.append(occ.addLine(cur, a))
         cur = a
-    if L > 0:
+    if L > 0 and o.spinner == "cone":
+        (rt, zt_), zc, rn, (rf, zf), _a = cone_geometry(rh, zt, L)
+        t = pt(rt, zt_)
+        curves.append(occ.addLine(cur, t))
+        f = pt(rf, zf)
+        c = occ.addPoint(0.0, 0.0, zc)
+        curves.append(occ.addCircleArc(t, c, f))
+        a = pt(0.0, zf)
+        curves.append(occ.addLine(f, a))
+        cur = a
+    elif L > 0:
         sp = profile(o, rh, h, n_round=2, n_spin=40)
         k = int(np.argmin(np.abs(sp[:, 1] - zt) + np.abs(sp[:, 0] - rh)))
         tail = sp[k + 1:-1]                     # up to the nose flat; the last point is on the axis
@@ -522,7 +590,13 @@ def add_cli_args(p):
     g.add_argument("--set-screw", type=float, default=0.0, help="radial set-screw hole diameter [mm]")
     g.add_argument("--nut-hex", type=float, default=0.0, help="hex pocket for a prop nut, across flats [mm]")
     g.add_argument("--nut-depth", type=float, default=3.0, help="hex pocket depth [mm]")
-    g.add_argument("--root-fillet", type=float, default=0.0, help="blade-root fillet radius [mm]")
+    g.add_argument("--root-fillet", type=float, default=0.0,
+                   help="blade-root fillet size [mm] (how far it reaches out from the blade at the hub)")
+    g.add_argument("--fillet-shape", choices=FILLET_SHAPES, default="round",
+                   help="round (concave blend, default) or chamfer (straight)")
+    g.add_argument("--fillet-length", type=float,
+                   help="how far the fillet runs up the blade [mm] (default: the size, a quarter circle; longer "
+                        "= a gentler blend)")
     g.add_argument("--blade-offset", type=float, default=0.0,
                    help="move the blades along the axis [mm] (+ = towards the thrust side)")
 
@@ -535,4 +609,5 @@ def from_args(a) -> HubOptions:
                       head_depth_mm=a.mount_head_depth, bore_tolerance_mm=a.bore_tolerance, dflat_mm=a.d_flat,
                       bore_depth_mm=a.bore_depth,
                       set_screw_mm=a.set_screw, nut_hex_mm=a.nut_hex, nut_depth_mm=a.nut_depth,
-                      fillet_mm=a.root_fillet, blade_offset_mm=a.blade_offset)
+                      fillet_mm=a.root_fillet, fillet_shape=a.fillet_shape, fillet_length_mm=a.fillet_length,
+                      blade_offset_mm=a.blade_offset)

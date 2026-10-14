@@ -75,7 +75,8 @@ base = propgen.design(propgen.DesignSpec())
 t_design = time.time() - t
 print("   " + propgen.summary_text(base).replace("\n", "\n   ")[:1400] + "\n   ...")
 print(f"   design() took {t_design:.1f} s ({base.timings})")
-check(t_design < 8.0, f"design() with default settings runs in a few seconds ({t_design:.1f} s)")
+# (the default design has a mode 8 % from 3P, so this includes the resonance avoidance: a few s more)
+check(t_design < 14.0, f"design() with default settings runs in a few seconds ({t_design:.1f} s)")
 check(240 <= base.diameter_mm <= 254.01, f"diameter {base.diameter_mm:.1f} mm (<= 254 mm max)")
 check(3.5 * 25.4 <= base.pitch75_mm <= 6.0 * 25.4, f"pitch at 75 % R {base.pitch75_mm / 25.4:.2f} in (hobby props: 4-6 in)")
 check(abs(base.electrical["motor_input_power"] - 400) < 4 and abs(base.electrical["throttle"] - 1) < 0.01,
@@ -352,7 +353,7 @@ check(d1.counterweight is None and "none" in propgen.summary_text(d1), "1 blade 
 for af, aero in (("biconvex5", "neuralfoil"), ("dwedge5", "analytic"), ("sc20406", "neuralfoil")):
     d = propgen.design(propgen.DesignSpec(source="shaft", rpm=26000, shaft_power_W=6000, diameter_mm=300,
                                           max_diameter_mm=300, blades=2, airspeed=150, airfoil=af, aero=aero,
-                                          max_tip_mach=1.3))
+                                          max_tip_mach=1.3, out_of_reach="aero"))     # aerodynamics only
     v = propgen.verify(d)
     e = v["rel_error"]
     line = f"supersonic tips, {propgen.airfoil_label(af)} ({aero}): tip Mach {d.tip_mach:.2f}, {d.thrust_N:.1f} N, " \
@@ -397,9 +398,26 @@ vq = propgen.verify(dq)
 check(vq["motor_mode"].get("limited_by", "").startswith("motor torque"),
       f"round trip in PropSim motor mode honours the limit ({vq['motor_mode'].get('limited_by')})")
 
+# a prop designed at 30 m/s, the motor at its torque limit there: below the design speed full throttle needs
+# more torque. Respect: redesigned so it stays within the limit from the stall speed up; Limit throttle: the
+# design is kept and the throttle / current limit to use is given
+LS = dict(kv=920, cells=4, motor_power_W=400, max_torque_Nm=0.25, airspeed=30, low_speed=10, aero="analytic",
+          respect_strength=False, avoid_resonance=False)
+dLr = propgen.design(propgen.DesignSpec(**LS))
+dLt = propgen.design(propgen.DesignSpec(**LS, low_speed_mode="throttle"))
+lr, lt = dLr.low_speed, dLt.low_speed
+check(max(lr["torque_by_speed"]) <= 0.25 * 1.003 and dLr.notes[0].startswith("LOW SPEED: designed")
+      and abs(dLt.torque_Nm / 0.25 - 1) < 0.01 and lt["over"] and 0 < lt["throttle"] < 1
+      and dLt.notes[0].startswith("LOW SPEED") and "Keep the throttle below" in dLt.notes[0]
+      and "Full throttle below the design speed" in propgen.summary_text(dLr),
+      f"low speed (10-30 m/s, 0.25 N m limit): respect -> {dLr.torque_Nm:.3f} N m at 30 m/s, at most "
+      f"{max(lr['torque_by_speed']):.3f} lower down ({pct(dLr.thrust_N / dLt.thrust_N - 1)} thrust); limit throttle "
+      f"-> {max(lt['torque_by_speed']):.3f} N m at {lt['airspeed']:.0f} m/s, throttle {100 * lt['throttle']:.0f} %")
+
 # high advance ratio, transonic tips: the chord cap binds outboard but costs next to nothing
 dc = propgen.design(propgen.DesignSpec(source="shaft", shaft_power_W=8000, rpm=21000, max_tip_mach=1.0,
-                                       max_diameter_mm=400, airfoil="sc20706", airspeed=150, aero="analytic"))
+                                       max_diameter_mm=400, airfoil="sc20706", airspeed=150, aero="analytic",
+                                       out_of_reach="aero"))
 capn = [n for n in dc.notes if n.startswith("chord capped")]
 check(len(capn) == 1 and capn[0] in dc.minor_notes and "can be ignored" in capn[0] and "to clear it" in capn[0]
       and not any(n.startswith("sections at their lift limit") for n in dc.notes),
@@ -436,7 +454,7 @@ FEATS = {
     "all": feat_mod.BladeFeatures(sweep_deg=25, serration_depth=0.15, tubercle_amp=0.04, tip="winglet"),
 }
 for name, f in FEATS.items():
-    df = propgen.design(propgen.DesignSpec(**SPEC12, features=f))
+    df = propgen.design(propgen.DesignSpec(**SPEC12, features=f, out_of_reach="aero"))   # aerodynamics only
     m = propgen.build_mesh(df, "normal")
     vf = propgen.verify(df)
     e = vf["rel_error"]
@@ -541,6 +559,28 @@ dx_ = propgen.design(propgen.DesignSpec(source="shaft", rpm=26000, shaft_power_W
 check(any(n.startswith("STRENGTH LIMIT NOT REACHABLE") for n in dx_.notes) and not dx_.structure["ok"],
       f"PLA at 26000 rpm, 2.5 kW: limit not reachable, aerodynamic design shown and flagged "
       f"(SF {dx_.structure['sf_overall']:.2f})")
+# out of reach at a fixed size and speed: the thickened blade is kept (much stronger than the aerodynamic one)
+FX = dict(diameter_mm=254, max_diameter_mm=254, blades=2, aero="analytic", source="shaft", rpm=22000,
+          shaft_power_W=4000, airspeed=120, max_tip_mach=1.3, avoid_resonance=False)
+da_ = propgen.design(propgen.DesignSpec(**FX, out_of_reach="aero"))
+ds_ = propgen.design(propgen.DesignSpec(**FX))
+check(getattr(da_, "strength_fallback", False) and getattr(ds_, "strength_strongest", False)
+      and ds_.structure["sf_overall"] > 2 * da_.structure["sf_overall"]
+      and any(n.startswith("STRENGTH LIMIT NOT REACHABLE") for n in ds_.notes),
+      f"limit out of reach at fixed size / speed (PLA, 22000 rpm, 4 kW): thickened blade kept, SF "
+      f"{ds_.structure['sf_overall']:.2f} vs aerodynamic {da_.structure['sf_overall']:.2f}")
+# thickness set by hand: root and tip t/c follow, the minimum thickness holds (up to the rounded tip)
+dt_ = propgen.design(propgen.DesignSpec(**S12, aero="analytic", respect_strength=False, tc_root=0.20, tc_tip=0.09,
+                                        min_thickness_mm=1.0))
+d0_ = propgen.design(propgen.DesignSpec(**S12, aero="analytic", respect_strength=False))
+r_ = np.asarray(dt_.r_mm) / (dt_.diameter_mm / 2)
+tc_t = np.interp([0.35, 0.9], r_, dt_.tc)
+tc_0 = np.interp([0.35, 0.9], np.asarray(d0_.r_mm) / (d0_.diameter_mm / 2), d0_.tc)
+inb = r_ <= 0.95
+tmin = float(np.min((np.asarray(dt_.tc) * np.asarray(dt_.chord_mm))[inb]))
+check(tc_t[0] > tc_0[0] + 0.02 and abs(tc_t[1] - 0.09) < 0.015 and tmin >= 0.95,
+      f"root / tip thickness 20 % / 9 %: t/c {tc_t[0]:.3f} at 0.35 R (default {tc_0[0]:.3f}), {tc_t[1]:.3f} at 0.9 R, "
+      f"thinnest section to 0.95 R {tmin:.2f} mm (min 1 mm)")
 dw_ = propgen.design(propgen.DesignSpec(**S12, material="Beech wood", process="FDM 3D print"))
 check(any("not usually made by" in n for n in dw_.notes), "unusual material / process pair is flagged")
 try:
@@ -696,6 +736,25 @@ if not QUICK:
     except ImportError:
         pass
 check(ok_, line)
+# cone spinner: a straight cone with a tangent spherical nose (no knob where the nose starts), same in STL and STEP
+pc_ = hubgeom.profile(hubgeom.HubOptions(spinner="cone"), 20.0, 18.0)
+sp_ = pc_[pc_[:, 1] >= 9.0 - 1e-9]
+d_ = np.diff(sp_, axis=0)
+turn = np.degrees(np.abs(np.diff(np.arctan2(d_[:, 1], -d_[:, 0]))))
+dc_ = propgen.design(propgen.DesignSpec(**S12, aero="analytic", hub=hubgeom.HubOptions(spinner="cone")))
+mc_ = propgen.build_mesh(dc_)
+ok_ = bool(np.all(np.diff(sp_[:, 0]) <= 1e-9)) and turn[:-1].max() < 6.0 and mc_.is_watertight
+line = f"cone spinner: radius shrinks steadily to the nose, largest turn {turn[:-1].max():.1f} deg, STL watertight"
+if not QUICK:
+    try:
+        import gmsh  # noqa: F401
+        ic_ = propgen.export_step(dc_, os.path.join(TMP, "cone.step"))
+        ok_ = ok_ and ic_["volumes"] == 1 and ic_["check"]["open_edges"] == 0 and \
+            abs(ic_["check"]["volume_occ_mm3"] / mc_.volume - 1) < 0.01
+        line += f"; STEP volume {pct(ic_['check']['volume_occ_mm3'] / mc_.volume - 1)} vs the STL"
+    except ImportError:
+        pass
+check(ok_, line)
 # blind bore from the motor side, with the set screw moved into it; a rotated bolt circle
 db_ = propgen.design(propgen.DesignSpec(**S12, aero="analytic", hub_height_mm=30,
                                         hub=hubgeom.HubOptions(bore_depth_mm=8, set_screw_mm=3, holes=4,
@@ -725,6 +784,90 @@ if not QUICK:
                   f"{info['seconds']:.0f} s")
     except ImportError:
         pass
+
+# --------------------------------------------------------------------------- 17. structure tab, fillets
+print("\n17. Structure analysis (stress field, deflection, mode shapes, diagnosis); root fillet options")
+import structview   # noqa: E402
+dS = propgen.design(propgen.DesignSpec(**S12, aero="analytic"))
+cS = structview.from_design(dS)
+FS = cS.fields()
+i_, j_, rc_, xc_, side_ = cS.critical()
+V0, V1 = cS.surface(), cS.surface(deflect=1.0)
+tipmove = float(np.abs(V1[-1, :, 2] - V0[-1, :, 2]).mean())
+md_ = cS.vb["modes"][0]
+Vm = cS.surface(mode=md_, amp=0.01)
+check(abs(FS["sf"].min() - dS.structure["sf_min"]) < 1e-6 and FS["sf"].shape == dS.structure["sigma_points"].shape
+      and V0.shape[:2] == FS["sf"].shape and abs(tipmove - abs(dS.structure["deflection_a"][-1])) < 2e-4
+      and all("shape" in m for m in cS.vb["modes"]) and abs(np.abs(md_["shape"]["a"]).max() - 1) < 1e-6
+      or np.abs(md_["shape"]["t"]).max() > 0.99,
+      f"design: stress field {FS['sf'].shape}, weakest SF {FS['sf'].min():.2f} at r {1e3 * rc_:.0f} mm ({side_}, "
+      f"x/c {xc_:.2f}) = the strength check's; tip moves {1e3 * tipmove:.2f} mm under load; "
+      f"{len(cS.vb['modes'])} mode shapes")
+dg_ = cS.diagnosis()
+check(dg_[0][0] in ("ok", "warn", "bad") and any("Weakest spot" in t for _, t in dg_)
+      and any("centrifugal" in t for _, t in dg_), "diagnosis: verdict, weakest spot, stress breakdown")
+oS = propsim.simulate(["--test-prop", "--tip-speed", "150", "--aero", "analytic"])
+cD = structview.analyse_outcome(oS, "Nylon PA12", "Powder bed print (SLS/MJF)")
+check(np.isfinite(cD.st["sf_overall"]) and cD.st["sf_overall"] > 0 and cD.vb is not None
+      and cD.st["points"].shape[0] == 50 and "measured" in cD.notes[0],
+      f"dashboard model (test prop, PA12 SLS): SF {cD.st['sf_overall']:.2f}, weakest at r "
+      f"{1e3 * cD.critical()[2]:.0f} mm, 1st mode {cD.vb['modes'][0]['freq_design']:.0f} Hz")
+# root fillet: shape and length options, credited in the strength check, valid STL / STEP
+SR = dict(S12, aero="analytic", respect_strength=False)
+kts, oks = {}, True
+for name, ho in (("none", hubgeom.HubOptions()), ("round 2", hubgeom.HubOptions(fillet_mm=2)),
+                 ("elliptic 2x6", hubgeom.HubOptions(fillet_mm=2, fillet_length_mm=6)),
+                 ("chamfer 2", hubgeom.HubOptions(fillet_mm=2, fillet_shape="chamfer"))):
+    dF = propgen.design(propgen.DesignSpec(**SR, hub=ho))
+    mF = propgen.build_mesh(dF)
+    kts[name] = dF.structure["kt_root"]
+    ok_ = mF.is_watertight
+    if not QUICK and ho.fillet_mm:
+        try:
+            import gmsh  # noqa: F401
+            iF = propgen.export_step(dF, os.path.join(TMP, "fillet.step"))
+            ok_ = ok_ and iF["volumes"] == 1 and iF["check"]["open_edges"] == 0 and \
+                abs(iF["check"]["volume_occ_mm3"] / mF.volume - 1) < 0.01
+        except ImportError:
+            pass
+    oks = oks and ok_
+check(oks and kts["none"] == 1.5 and kts["elliptic 2x6"] < kts["round 2"] < kts["chamfer 2"] < 1.5,
+      "root fillet round / elliptic / chamfer: watertight STL, one closed STEP solid each; root Kt "
+      + ", ".join(f"{k} {v:.2f}" for k, v in kts.items()))
+dH = propgen.design(propgen.DesignSpec(**SR, tc_hub=0.40))
+check(abs(np.interp(dH.hub_diameter_mm / 2, dH.profile["r"] * 1e3, dH.profile["tc"]) - 0.40) < 0.03,
+      f"hub-end thickness 40 %: t/c at the hub {np.interp(dH.hub_diameter_mm / 2, dH.profile['r'] * 1e3, dH.profile['tc']):.3f}")
+
+# the strength sizing: a fully stressed (tapered) thickness from the tip in; a design whose target is out of
+# reach is still sized; a hand-set hub that holds the root back is named in the note and the diagnosis
+kT = structure.thickness_scale_tapered(dict(r=np.linspace(0.01, 0.1, 10), N=np.linspace(100.0, 0.0, 10),
+                                            sigma_cf=np.full(10, 6e6), sigma_max=np.full(10, 12e6),
+                                            sf=np.full(10, 1.5)), 2.0)
+dU = propgen.design(propgen.DesignSpec(aero="analytic", source="shaft", rpm=8000, shaft_power_W=400, diameter_mm=254))
+dB = propgen.design(propgen.DesignSpec(aero="analytic", source="shaft", rpm=9000, shaft_power_W=400, diameter_mm=254,
+                                       hub_diameter_mm=22, hub_height_mm=10))
+dgB = structview.from_design(dB).diagnosis()
+check(np.all(np.diff(kT) <= 1e-9) and kT[0] > kT[-2] > 1
+      and any("cannot be met" in n for n in dU.notes) and dU.structure["sf_overall"] > 1.9
+      and getattr(dB, "strength_strongest", False) and any(n.startswith("STRENGTH LIMIT") and "leave the hub height and diameter blank" in n for n in dB.notes[:2])
+      and any(lv == "warn" and "leave the hub height" in t for lv, t in dgB[:3]),
+      f"strength sizing: tapered factors {kT[0]:.2f} (root) to {kT[-1]:.2f} (tip); out-of-reach target still "
+      f"sized (SF {dU.structure['sf_overall']:.2f}); a set 22 x 10 mm hub limits the root to SF "
+      f"{dB.structure['sf_overall']:.2f} and the note and diagnosis say so")
+
+# resonance avoidance: a mode on 3P at the design speed is moved with a stiffer root (hub-end thickness, hub
+# diameter, on auto), for next to no thrust and no loss of strength; off, it is only reported
+RA = dict(aero="analytic", source="shaft", rpm=20000, shaft_power_W=1500, diameter_mm=254, max_tip_mach=1.3,
+          material="Titanium Ti-6Al-4V", process="Metal print (SLM/DMLS)")
+dR0 = propgen.design(propgen.DesignSpec(**RA, avoid_resonance=False))
+dR1 = propgen.design(propgen.DesignSpec(**RA))
+rf_ = getattr(dR1, "resonance_fix", None) or {}
+check(not dR0.vibration["ok"] and dR1.vibration["ok"] and any(n.startswith("RESONANCE AVOIDED") for n in dR1.notes[:3])
+      and abs(dR1.thrust_N / dR0.thrust_N - 1) < propgen.RES_COST_MAX
+      and dR1.structure["sf_overall"] >= 0.99 * min(2.0, dR0.structure["sf_overall"]) and rf_.get("changes"),
+      f"resonance avoided: margin {100 * propgen.resonance_margin(dR0.vibration):.0f} % -> "
+      f"{100 * propgen.resonance_margin(dR1.vibration):.0f} % with {rf_.get('changes')}; thrust "
+      f"{pct(dR1.thrust_N / dR0.thrust_N - 1)}, SF {dR0.structure['sf_overall']:.2f} -> {dR1.structure['sf_overall']:.2f}")
 
 # --------------------------------------------------------------------------- CLI
 print("\n8. Command line")

@@ -36,6 +36,8 @@ args = [
     "--hidden-import", "features",          # experimental blade features (propgen / propsim)
     "--hidden-import", "structure",         # blade strength (propgen)
     "--hidden-import", "hubgeom",           # hub options and hub solids (propgen)
+    "--hidden-import", "structview",        # Structure tab: stress field, mode shapes, diagnosis
+    "--hidden-import", "structtab",         # Structure tab (GUI)
     "--hidden-import", "threadpoolctl",     # one BLAS thread for the small vibration eigenproblems
     "--hidden-import", "manifold3d",        # trimesh booleans (one-solid prop meshes, counterweight)
     "--exclude-module", "matplotlib",

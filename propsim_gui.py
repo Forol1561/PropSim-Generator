@@ -1738,7 +1738,7 @@ class InputError(ValueError):
 
 class App:
     TABS = (("dash", "Dashboard"), ("geom", "Geometry"), ("report", "Report"), ("cfd", "3D CFD"),
-            ("gen", "Prop Generator"))
+            ("gen", "Prop Generator"), ("struct", "Structure"))
     STEPS = (("blockMesh", "base mesh"), ("features", "features"), ("decomposePar", "decompose"),
              ("snappyHexMesh", "snappy"), ("topoSet", "MRF zone"), ("checkMesh", "check"), ("solver", "solve"),
              ("reconstructPar", "merge"))
@@ -2099,6 +2099,8 @@ class App:
         self._build_report(self.pages["report"])
         self._build_cfd(self.pages["cfd"])
         self._build_gen(self.pages["gen"])
+        import structtab
+        self.struct_tab = structtab.StructTab(self, self.pages["struct"], sys.modules[__name__])
         self._show_tab("dash")
 
     def _show_tab(self, key):
@@ -2116,6 +2118,8 @@ class App:
             self.view3d.wake()
         elif key == "gen":
             self.gen_view.wake()
+        if hasattr(self, "struct_tab"):
+            self.struct_tab.show(key == "struct")
 
     def _build_dashboard(self, page):
         page.columnconfigure(0, weight=1)
@@ -2754,6 +2758,11 @@ class App:
                         "ok", right=f"{dt:.1f} s")
 
     def _show_outcome(self, o):
+        if hasattr(self, "struct_tab"):
+            try:
+                self.struct_tab.on_outcome(o)
+            except Exception:  # noqa: BLE001 - the Structure tab must never break a result
+                traceback.print_exc()
         r, a, g, e = o.res, o.args, o.geom, o.elec
         self._set_report(o.text.lstrip("\n"))
         R = g.radius
@@ -3555,14 +3564,14 @@ class App:
                              else {"Clark-Y": "clarky"})
         for k, val in dict(gen_goal="Max thrust", gen_src="Motor (left panel)", gen_target="", gen_rpm="",
                            gen_pshaft="", gen_blades="2", gen_cw="Solid (prop material)", gen_dens="1.24",
-                           gen_sup="Generic", gen_mat="PLA", gen_proc="FDM 3D print", gen_uts="60", gen_mod="3.5", gen_sf="2",
+                           gen_tc_root="", gen_tc_tip="", gen_tc_hub="", gen_tmin="0.6", gen_fshape="Round", gen_flen="", gen_oor="Strongest", gen_sup="Generic", gen_mat="PLA", gen_proc="FDM 3D print", gen_uts="60", gen_mod="3.5", gen_sf="2",
                            gen_alt="30", gen_pitch="", gen_pmode="At 75 % R",
                            gen_sweep="", gen_sweep0="0.35", gen_serr="", gen_serr_w="15", gen_serr_span="0.5-0.95",
                            gen_tub="", gen_tub_w="30", gen_tub_span="0.3-0.9", gen_tip="None",
                            gen_wl_h="6", gen_wl_cant="80", gen_wl_dir="Up", gen_rake="45", gen_rake_len="12",
                            gen_dmax="254", gen_dfix="", gen_mach="0.6",
                            gen_airfoil=next(iter(self.gen_airfoils)), gen_spin="CCW", gen_bore="5",
-                           gen_hub="", gen_hub_h="", gen_edge="Sharp", gen_edge_mm="1", gen_spinner="None",
+                           gen_hub="", gen_hub_h="", gen_vlow="", gen_vlow_mode="Respect", gen_edge="Sharp", gen_edge_mm="1", gen_spinner="None",
                            gen_spinner_len="", gen_pocket="", gen_tol="0", gen_bore_dep="", gen_hang="", gen_dflat="", gen_setscrew="",
                            gen_hex="", gen_hex_d="3", gen_holes="", gen_hole_d="3.2", gen_pcd="16",
                            gen_head="None", gen_head_d="6", gen_head_dep="3", gen_fillet="", gen_offset="0",
@@ -3659,9 +3668,22 @@ class App:
                 ("airspeed", "Airspeed", "m/s", "Design airspeed (forward flight); 0 = static thrust (hover). "
                  "The same setting as card 04 on the left: changing one changes both."),
                 ("rho", "Air density", "kg/m³", "1.225 at sea level, ~1.11 at 1000 m, ~1.0 at 2000 m. The same "
-                 "setting as card 04 on the left.")):
+                 "setting as card 04 on the left."),
+                ("gen_vlow", "Stall speed", "m/s · 0", "Stall / takeoff speed (motor designs with an airspeed): full "
+                 "throttle is also checked there, and at every speed up to the design airspeed, against the "
+                 "motor's Max torque (card 05). A prop made for top speed loads up at low speed, so the torque and "
+                 "current rise. Blank = standstill (0 m/s), the worst case.")):
             row(key, label, unit, tip, r)
             r += 1
+        lab = self._label(b, "At low speed", "When full throttle at the stall speed would go over the Max "
+                          "torque. Respect: redesign with less torque at the design speed so full throttle "
+                          "stays within the limit from the stall speed up (costs some top-speed thrust; the notes "
+                          "say how much). Throttle: keep the fastest design and get the throttle (or motor "
+                          "current limit for the ESC) to use below the speed where full throttle is safe.")
+        lab.grid(row=r, column=0, sticky="w", pady=px(3))
+        self._seg(b, "gen_vlow_mode", ["Respect", "Throttle"]).grid(
+            row=r, column=1, columnspan=2, sticky="ew", pady=px(3))
+        r += 1
         self._label(b, "Blades", "1 = a single blade balanced by a counterweight opposite it: the least "
                     "blade interference and tip loss for its blade area, used on some gliders and record "
                     "models. 2+ blades usually give more thrust for the same diameter.").grid(
@@ -3692,6 +3714,26 @@ class App:
         self.v["gen_airfoil"].trace_add("write", lambda *_: self._gen_af_info())
         self._gen_af_info()
         r += 1
+        for key, label, unit, tip in (
+                ("gen_tc_root", "Root thickness", "% · auto", "Thickness of the blade sections near the hub, in % "
+                 "of the chord (4 to 33). Blank = the airfoil's own thickness profile, thicker towards the root. "
+                 "Thicker sections are stiffer and stronger in bending (higher vibration frequencies) for a "
+                 "little more drag, but heavier: on fast props, where most of the stress is centrifugal, they "
+                 "can lower the safety factor. A thick root also needs hub height to fit. 'Design within "
+                 "strength limits' thickens weak sections and grows the hub on its own, so leave this blank "
+                 "unless you want a particular shape."),
+                ("gen_tc_tip", "Tip thickness", "% · auto", "Thickness of the tip sections in % of the chord "
+                 "(4 to 33). Blank = the airfoil's own, thinned automatically for fast (transonic) tips; a value "
+                 "here is used as is."),
+                ("gen_tc_hub", "Hub-end thickness", "% · 24", "Thickness of the blade where it meets the hub, in % "
+                 "of the chord (4 to 55; blank = 24, or the root thickness if that is more, or more when 'Avoid "
+                 "resonance' needs a stiffer root). This part sits in "
+                 "the hub cut-off, so it costs no thrust: it is the most effective way to strengthen the root by "
+                 "hand. A thick root needs hub height to fit (leave Hub height on auto, or raise it)."),
+                ("gen_tmin", "Min thickness", "mm", "No section is thinner than this anywhere (tip and edges "
+                 "included): 0.6 mm suits FDM / resin printing; use more for strength or a coarse process.")):
+            row(key, label, unit, tip, r)
+            r += 1
         self._label(b, "Spin", "Rotation seen from the front (the side the thrust points to). Most "
                     "motors' 'normal' props are CCW.").grid(row=r, column=0, sticky="w", pady=px(3))
         self._seg(b, "gen_spin", ["CCW", "CW"]).grid(row=r, column=1, columnspan=2, sticky="ew", pady=px(3))
@@ -3709,11 +3751,15 @@ class App:
                 self.gen_hub_widgets.setdefault(group, []).extend(w_)
             r += 1
 
-        def hseg(key, label, values, tip, group=None):
+        def hseg(key, label, values, tip, group=None, menu=False):
             nonlocal r
             lab = self._label(b, label, tip)
             lab.grid(row=r, column=0, sticky="w", pady=px(3))
-            sg = self._seg(b, key, values, command=lambda _v: self._gen_hub_rows())
+            if menu:    # long labels: a drop-down, a segmented button would clip them in this column
+                sg = self._option(b, key, values, width=150)
+                sg.configure(command=lambda _v: self._gen_hub_rows())
+            else:
+                sg = self._seg(b, key, values, command=lambda _v: self._gen_hub_rows())
             sg.grid(row=r, column=1, columnspan=2, sticky="ew", pady=px(3))
             if group:
                 self.gen_hub_widgets.setdefault(group, []).extend([lab, sg])
@@ -3726,7 +3772,7 @@ class App:
         hrow("gen_edge_mm", "Edge size", "mm", "Chamfer size or edge radius.", "edge")
         hseg("gen_spinner", "Spinner", ["None", "Cone", "Dome", "Ogive"], "A streamlined nose on the front "
              "(thrust side) of the hub. In fast forward flight it removes most of the bare hub's drag (the 3D CFD "
-             "shows it). Without a pocket the bore ends under it.")
+             "shows it). Without a pocket the bore ends under it.", menu=True)
         hrow("gen_spinner_len", "Spinner length", "mm · auto", "Blank = from the hub size (dome 1, cone 1.6, "
              "ogive 2 hub radii).", "spinner")
         hrow("gen_pocket", "Spinner pocket", "mm · none", "Diameter of a pocket inside the spinner for the end "
@@ -3754,15 +3800,25 @@ class App:
              "blade 1, counter-clockwise seen from the front (for a CW prop, mirrored with the prop). Blank = half "
              "the hole spacing from the blade (4 holes: 45°, 3 holes: 60°, 2 holes: 90°).", "holes")
         hseg("gen_head", "Screw heads", ["None", "Countersink", "Counterbore"], "A recess on the front for "
-             "the screw heads.", "holes")
+             "the screw heads: a countersink (cone, for flat-head screws) or a counterbore (flat-bottomed "
+             "pocket, for socket-head screws).", "holes", menu=True)
         hrow("gen_head_d", "Head size", "mm", "Diameter of the head recess.", "head")
         hrow("gen_head_dep", "Head depth", "mm", "Depth of the counterbore.", "cbore")
-        hrow("gen_fillet", "Root fillet", "mm · none", "A rounded fillet where each blade meets the hub: "
-             "less stress concentration at the root and a stronger, cleaner print.")
+        hrow("gen_fillet", "Root fillet", "mm · none", "A fillet where each blade meets the hub: how far it "
+             "reaches out from the blade at the hub surface. Less stress concentration at the root (the strength "
+             "check counts it: a sharp root has Kt 1.5, a fillet about as big as the root thickness ~1.2) and a "
+             "stronger, cleaner print.")
+        hseg("gen_fshape", "Fillet shape", ["Round", "Chamfer"], "Round: a concave blend (quarter circle, or a "
+             "quarter ellipse with a longer Fillet length), the best for stress. Chamfer: a straight 45° (or "
+             "longer) wedge, simpler to machine.", "fillet")
+        hrow("gen_flen", "Fillet length", "mm · = size", "How far up the blade the fillet runs. Blank = the same "
+             "as its size (a quarter circle). Longer = a gentler, elliptic blend that spreads the load over more "
+             "of the root (lower stress concentration).", "fillet")
         hrow("gen_offset", "Blade offset", "mm", "Moves the blades along the axis: + towards the thrust side "
              "(front), - towards the motor.")
         self.v["gen_holes"].trace_add("write", lambda *_: self._gen_hub_rows())
         self.v["gen_hex"].trace_add("write", lambda *_: self._gen_hub_rows())
+        self.v["gen_fillet"].trace_add("write", lambda *_: self._gen_hub_rows())
         self._gen_hub_rows()
         hseg("gen_step", "STEP surface", ["Exact", "Smooth"], "Exact: every blade is a B-spline surface "
              "through every point of the STL's surface, so the STEP keeps all its details (tubercles, teeth, "
@@ -3827,6 +3883,25 @@ class App:
                     "the hub grows if the root needs it, and if that is still not enough a slower or smaller prop "
                     "is chosen. Off: the blade is designed for aerodynamics only and the stresses are just "
                     "reported.")
+        r += 1
+        self.gen_avoid_res = tk.BooleanVar(value=True)
+        sw = self._switch(b, "Avoid resonance", self.gen_avoid_res)
+        sw.grid(row=r, column=0, columnspan=3, sticky="w", pady=(px(2), px(2)))
+        Tooltip(sw, "On: when a blade mode lands within 10 % of 1P-4P at the design speed, the generator tries a "
+                    "stiffer (or softer) root - hub-end thickness, hub diameter, then root thickness, only where "
+                    "you left them on auto - and keeps the variant that clears it for the least thrust (at most "
+                    "3 %), never weaker than the safety factor. The notes say what it changed. Off: the "
+                    "resonance is only reported.")
+        r += 1
+        lab = self._label(b, "If out of reach", "When no diameter / rpm in the scan reaches the safety factor in "
+                          "this material and process. Strongest: keep the strongest design the strength sizing "
+                          "found (the thickest blade, biggest hub and slowest / smallest prop it tried), flagged "
+                          "'limit not reachable'. Aerodynamic: show the plain aerodynamic design and report its "
+                          "stresses. Either way, a stronger material or process, a lower tip speed or more blades "
+                          "is the real fix.")
+        lab.grid(row=r, column=0, sticky="w", pady=px(3))
+        self._seg(b, "gen_oor", ["Strongest", "Aerodynamic"]).grid(row=r, column=1, columnspan=2, sticky="ew",
+                                                                   pady=px(3))
         r += 1
         self.v["gen_mat"].trace_add("write", lambda *_: self._gen_material())
         self.v["gen_sup"].trace_add("write", lambda *_: self._gen_supplier())
@@ -4181,12 +4256,17 @@ class App:
                 return 0.0
         holes = num("gen_holes") > 0
         on = {"edge": self.v["gen_edge"].get() != "Sharp", "spinner": self.v["gen_spinner"].get() != "None",
-              "hex": num("gen_hex") > 0, "holes": holes,
+              "hex": num("gen_hex") > 0, "holes": holes, "fillet": num("gen_fillet") > 0,
               "head": holes and self.v["gen_head"].get() != "None",
               "cbore": holes and self.v["gen_head"].get() == "Counterbore"}
         for g, ws in self.gen_hub_widgets.items():
             for w in ws:
                 w.grid() if on.get(g, True) else w.grid_remove()
+
+    def _pct_tc(self, key, label):
+        """A thickness field in % of the chord as a t/c fraction (None = auto)."""
+        x = self._num(key, label, lo=4, hi=33)
+        return None if x is None else x / 100.0
 
     def _gen_hub(self):
         """hubgeom.HubOptions from the form."""
@@ -4213,6 +4293,8 @@ class App:
                 nut_hex_mm=n("gen_hex", "Nut pocket", hi=100), nut_depth_mm=n("gen_hex_d", "Pocket depth", hi=100,
                                                                              default=3.0),
                 fillet_mm=n("gen_fillet", "Root fillet", hi=30),
+                fillet_shape=self.v["gen_fshape"].get().lower(),
+                fillet_length_mm=self._num("gen_flen", "Fillet length", lo=0, open_lo=True, hi=200),
                 blade_offset_mm=n("gen_offset", "Blade offset", lo=-200, hi=200))
         except ValueError as exc:
             raise InputError("gen_hub", str(exc)) from None
@@ -4233,6 +4315,15 @@ class App:
                   alt_load=(self._num("gen_alt", "Vibration load", lo=0, hi=150) or 0.0) / 100,
                   fatigue=bool(self._num("gen_alt", "Vibration load", lo=0, hi=150)),
                   respect_strength=bool(self.gen_respect.get()),
+                  out_of_reach="aero" if self.v["gen_oor"].get() == "Aerodynamic" else "strongest",
+                  tc_root=self._pct_tc("gen_tc_root", "Root thickness"),
+                  tc_tip=self._pct_tc("gen_tc_tip", "Tip thickness"),
+                  tc_hub=(lambda x: None if x is None else x / 100)(self._num("gen_tc_hub", "Hub-end thickness", lo=4,
+                                                                              hi=55)),
+                  avoid_resonance=bool(self.gen_avoid_res.get()),
+                  low_speed=self._num("gen_vlow", "Stall speed", lo=0, hi=propgen.MAX_AIRSPEED),
+                  low_speed_mode="throttle" if self.v["gen_vlow_mode"].get() == "Throttle" else "respect",
+                  min_thickness_mm=(lambda x: 0.6 if x is None else x)(self._num("gen_tmin", "Min thickness", lo=0, hi=20)),
                   pitch_mm=self._gen_pitch(),
                   pitch_mode="constant" if self.v["gen_pmode"].get() == "Constant" else "p75",
                   features=self._gen_features(),
@@ -4247,6 +4338,10 @@ class App:
                   airfoil=self.gen_airfoils.get(self.v["gen_airfoil"].get(), "clarky"),
                   spin=self.v["gen_spin"].get().lower(), aero=self.v["aero"].get(),
                   nf_model=self.v["nf_model"].get(), ncrit=self._num("ncrit", "Ncrit", lo=1, hi=14) or 9.0)
+        if kw["low_speed"] is not None and kw["airspeed"] > 0 and kw["low_speed"] >= kw["airspeed"]:
+            raise InputError("gen_vlow", "The stall speed must be below the design airspeed.")
+        if kw["airspeed"] == 0:
+            kw["low_speed"] = None
         if kw["airspeed"] >= 0.9 * kw["max_tip_mach"] * propgen.A_SOUND:
             raise InputError("gen_mach", f"At {kw['airspeed']:g} m/s the tip Mach limit must be above "
                                          f"{kw['airspeed'] / (0.9 * propgen.A_SOUND):.2f}: the blade tips also "
@@ -4381,6 +4476,10 @@ class App:
             return
         self.gen = (d, v)
         try:
+            self.struct_tab.on_design(d)
+        except Exception:  # noqa: BLE001 - the Structure tab must never break a design
+            traceback.print_exc()
+        try:
             self._gen_show(d, v)
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
@@ -4402,7 +4501,10 @@ class App:
                  ("hover" if d.airspeed == 0 else f"{d.airspeed:g} m/s", CYAN),
                  (f"hub Ø {d.hub_diameter_mm:.1f} · bore {d.bore_mm:g} mm", CYAN)]
         minor = getattr(d, "minor_notes", [])
-        warns = ([(n, AMBER) for n in d.notes if n not in minor] + [(n, CYAN) for n in d.notes if n in minor])[:3]
+        # a resonance the generator moved itself is information (cyan), not a warning
+        good = lambda n: n.startswith("RESONANCE AVOIDED")   # noqa: E731
+        warns = ([(n, CYAN if good(n) else AMBER) for n in d.notes if n not in minor]
+                 + [(n, CYAN) for n in d.notes if n in minor])[:3]
         if d.limited_by:
             warns.insert(0, (f"diameter set by {d.limited_by}", CYAN))
         if cw:
@@ -4454,7 +4556,12 @@ class App:
             vib = f"RESONANT {m0['name'].split('. ')[-1]} ≈ {m0['nearest_order']}P · "
         if stt:
             t["strength"].set(f"{stt['sf_overall']:.2f}" if stt["sf_overall"] < 99.5 else ">99", "SF",
-                              vib + ("" if stt["ok"] else f"need {d.spec.safety_factor:g} · ")
+                              vib + ("" if stt["ok"] else
+                                     f"limit not reachable, best {d.strength_best_sf:.2f} · "
+                                     if getattr(d, "strength_fallback", False) and hasattr(d, "strength_best_sf")
+                                     else "limit not reachable, strongest shown · "
+                                     if getattr(d, "strength_strongest", False)
+                                     else f"need {d.spec.safety_factor:g} · ")
                               + f"{stt['governing']} · {stt['mat']['material'][:18]}",
                               bar=min(stt["sf_overall"] / max(2 * d.spec.safety_factor, 1e-9), 1.0),
                               warn=not stt["ok"] or (vb is not None and not vb["ok"]))

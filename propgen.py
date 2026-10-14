@@ -69,6 +69,7 @@ MATERIALS = {k: v[0] for k, v in structure.MATERIAL_DB.items()}
 PROCESSES = list(structure.PROCESSES)
 TC_STRUCT_MAX = 0.30            # thickest section the strength sizing may ask for on the working blade
 TC_STRUCT_ROOT = 0.55           # ... and in the root transition into the hub (aerodynamically minor)
+TC_HUB_AUTO = 0.24              # t/c where the blade meets the hub, when not set
 RES_MARGIN_NOTE = 0.15           # how far a resonant mode should be moved (suggested speed change)
 TC_GEOM_MAX = 0.60              # thickest section the model may have (polars stop at TC_GRID[-1])
 PITCH_MODES = ("p75", "constant")
@@ -324,6 +325,12 @@ class DesignSpec:
     target_thrust_N: float | None = None
     # --- flight condition
     airspeed: float = 0.0                # design airspeed [m/s], 0 = static / hover
+    low_speed: float | None = None       # stall / takeoff speed [m/s] (None = static, 0): with a motor, full
+                                         # throttle is also checked there (the torque limit, current, rpm)
+    low_speed_mode: str = "respect"      # torque over the limit at the low speed: "respect" = redesign with
+                                         # less torque at the design speed so full throttle stays within it
+                                         # from the low speed up; "throttle" = keep the design, report the
+                                         # throttle / current limit to use below some speed
     rho: float = 1.225
     # --- constraints
     blades: int = 2
@@ -340,7 +347,8 @@ class DesignSpec:
     airfoil: str = "clarky"              # key of AIRFOILS
     tc_tip: float | None = None          # t/c at the tip (None = family default)
     tc_root: float | None = None         # t/c at the aerodynamic root (None = family default)
-    tc_hub: float = 0.24                 # t/c where the blade meets the hub
+    tc_hub: float | None = None          # t/c where the blade meets the hub (None = auto: TC_HUB_AUTO, or more
+                                         # when the resonance avoidance needs a stiffer root)
     spin: str = "ccw"                    # seen from the thrust side (+Z): "ccw" or "cw"
     # --- pitch: None = the optimum (free); else the geometric pitch [mm] the blade must have, either at
     #     75 % radius with the optimum twist shape ("p75") or constant along the blade ("constant")
@@ -365,6 +373,13 @@ class DesignSpec:
     alt_load: float = 0.3                # alternating load as a fraction of the steady aerodynamic bending
     respect_strength: bool = True        # True: design within the strength limits (thicken, else slow down);
                                          # False: design for aerodynamics only and report the stresses
+    out_of_reach: str = "strongest"      # when no size / speed in the scan reaches the safety factor:
+                                         # "strongest" = keep the strongest (thickened) design found,
+                                         # "aero" = show the aerodynamic design and report its stresses
+    avoid_resonance: bool = True         # a blade mode within the margin of 1P-4P at the design speed: try a
+                                         # stiffer root (hub-end thickness, hub diameter, root thickness where
+                                         # they are on auto) and keep the variant that clears it for at most a
+                                         # few % of the goal (design() does this)
     # --- analysis
     aero: str = "neuralfoil"             # "neuralfoil" or "analytic"
     nf_model: str = "large"
@@ -483,7 +498,7 @@ class _Ctx:
             self.tc_thinned = thin < self.tc_tip - 1e-4
             self.tc_tip = thin
         self.tc_root = sp.tc_root if sp.tc_root is not None else fam["tc_root"]
-        self.tc_hub = max(sp.tc_hub, self.tc_root)
+        self.tc_hub = max(TC_HUB_AUTO if sp.tc_hub is None else sp.tc_hub, self.tc_root)
         self.L_round = float(np.clip(self.c_min, 0.02 * R, 0.08 * R))
         self.r_round = R - self.L_round
         # height the root section keeps from the hub's top and bottom (plus fillet, blade offset, edges)
@@ -543,7 +558,9 @@ class _Ctx:
         if self.tc_floor is not None:          # thickened for strength
             tc = np.maximum(tc, np.interp(r, self.tc_floor[0], self.tc_floor[1]))
             return np.clip(tc, TC_GRID[0], TC_GEOM_MAX)
-        return np.clip(tc, TC_GRID[0], TC_GRID[-1])
+        # inside the hub cut-off (not analysed aerodynamically) a thick hub end is allowed; the analysed
+        # blade stays within the polars' range
+        return np.where(np.asarray(r) < self.r0, np.clip(tc, TC_GRID[0], TC_GEOM_MAX), np.clip(tc, TC_GRID[0], TC_GRID[-1]))
 
 
 def _rows_at(grid, tab, x):
@@ -787,6 +804,21 @@ class _Designer:
         if sp.features is None:
             sp.features = feat_mod.BladeFeatures()
         sp.features.validate()
+        if sp.low_speed_mode not in ("respect", "throttle"):
+            raise ValueError("low_speed_mode must be 'respect' or 'throttle'")
+        if sp.low_speed is not None and not (0 <= sp.low_speed < max(sp.airspeed, 1e-9) or sp.airspeed == 0):
+            raise ValueError("the stall / takeoff speed must be below the design airspeed")
+        if sp.out_of_reach not in ("strongest", "aero"):
+            raise ValueError("out_of_reach must be 'strongest' or 'aero'")
+        if sp.tc_hub is not None and not (TC_GRID[0] - 1e-9 <= sp.tc_hub <= TC_STRUCT_ROOT + 1e-9):
+            raise ValueError(f"hub-end thickness must be {100 * TC_GRID[0]:g} to {100 * TC_STRUCT_ROOT:g} % of the chord")
+        for name in ("tc_tip", "tc_root"):
+            v = getattr(sp, name)
+            if v is not None and not (TC_GRID[0] - 1e-9 <= v <= TC_GRID[-1] + 1e-9):
+                raise ValueError(f"{'tip' if name == 'tc_tip' else 'root'} thickness must be "
+                                 f"{100 * TC_GRID[0]:g} to {100 * TC_GRID[-1]:g} % of the chord")
+        if not 0 <= sp.min_thickness_mm <= 20:
+            raise ValueError("min thickness must be 0 to 20 mm")
         if sp.pitch_mm is not None:
             if not sp.pitch_mm > 0:
                 raise ValueError("pitch must be positive")
@@ -984,51 +1016,132 @@ class _Designer:
             rs, c, tc, beta, f_ax, f_t, ctx.rpm, self.mat, self.shape, self.xg, X_STACK, t_offset=off,
             camber=self.aero.camber, rho_air=ctx.rho, W=dd["W"], cl=dd["cl"], hub_radius=ctx.rh,
             bore_radius=sp.bore_mm / 2e3, hub_height=ctx.hub_h, blades=B, alt_load=sp.alt_load,
-            safety_factor=sp.safety_factor, fatigue=sp.fatigue, features=f, tip_mass=tip_m, tip_mass_radius=tip_r)
+            safety_factor=sp.safety_factor, fatigue=sp.fatigue, features=f, tip_mass=tip_m, tip_mass_radius=tip_r,
+            root_fillet=sp.hub.fillet_radius() / 1e3)
 
-    def size_for_strength(self, ctx, kind, target, vp, ev):
-        """Thicken under-strength sections (t/c up to TC_STRUCT_MAX on the working blade, TC_STRUCT_ROOT in
-        the root transition, chord kept) and re-solve; when that is used up and the weak spot is at the
-        root, make the hub taller, then wider (where they are not set by the user). Returns (ctx, vp,
-        eval, structure result). The result may still be below the safety factor: the caller then marks
-        the candidate infeasible, so the scan moves to a slower or smaller prop."""
+    def quick_check(self, D, rpm):
+        """Design method only (no BEMT check) at a fixed diameter and rpm, sized for strength as the scan
+        would: (goal value, safety factor, vibration) - a cheap screen for the resonance avoidance."""
+        sp = self.spec
+        _, kind, tgt = self.mode()
+        ctx = _Ctx(self, D, rpm)
+        vp, ev = _solve_vp(ctx, kind, tgt(rpm), rtol=1e-4)
+        if vp is None:
+            vp = float(ev["vp"])
+        st = None
+        if sp.respect_strength:
+            ctx, vp, ev, st = self.size_for_strength(ctx, kind, tgt(rpm), vp, ev, allow_closest=True)
+        p = self.profile(ctx, vp)
+        rs = ctx.rh + (0.995 * ctx.R - ctx.rh) * 0.5 * (1 - np.cos(np.linspace(0, np.pi, 41)))
+        if st is None:
+            st = self.struct_eval(ctx, vp, n=25)
+        vb = structure.vibration(rs, np.interp(rs, p["r"], p["chord"]), np.interp(rs, p["r"], p["tc"]),
+                                 np.interp(rs, p["r"], p["beta"]), rpm, self.mat, self.shape, self.xg, X_STACK,
+                                 n_speeds=3)
+        T, P = ev["T"], ev["P"]
+        if sp.goal == "target_thrust":
+            g = -P
+        elif sp.goal == "efficiency":
+            g = T * sp.airspeed / P if sp.airspeed > 0 else T ** 1.5 / P
+        else:
+            g = T
+        return g, st["sf_overall"], vb
+
+    def strength_cap(self, ctx, r):
+        """Thickest t/c the strength sizing may give the blade at radii r: TC_STRUCT_ROOT inside the hub
+        cut-off, tapering to the polars' TC_GRID[-1] across the root transition (aerodynamically minor:
+        the polars there are clamped at TC_GRID[-1]), TC_STRUCT_MAX on the working blade."""
+        r = np.asarray(r, float)
+        w = np.clip((r - ctx.r0) / max(ctx.rt - ctx.r0, 1e-9), 0, 1)
+        trans = TC_STRUCT_ROOT + (TC_GRID[-1] - TC_STRUCT_ROOT) * w
+        return np.where(r < ctx.r0, TC_STRUCT_ROOT, np.where(r < ctx.rt, trans, TC_STRUCT_MAX))
+
+    def hub_limits(self, D):
+        """Largest hub height and diameter the strength sizing may grow an auto hub to [m]."""
+        return 0.15 * D + 2 * self.spec.hub.margin_mm() / 1e3, 0.20 * D
+
+    def size_for_strength(self, ctx, kind, target, vp, ev, allow_closest=False):
+        """Thicken under-strength sections (t/c up to strength_cap, chord kept) and re-solve; when that is
+        used up or stops helping and the weak spot is at the root, make the hub taller, then wider (where
+        they are not set by the user), and thicken again. Returns (ctx, vp, eval, structure result) for
+        the strongest state seen. The result may still be below the safety factor: the caller then marks
+        the candidate infeasible, so the scan moves to a slower or smaller prop. allow_closest: the design
+        method's closest wake velocity is used when the target cannot be met (a design that is shown
+        anyway still gets sized)."""
         sp = self.spec
         D = 2 * ctx.R
         st = self.struct_eval(ctx, vp, n=25)
         sf_t = sp.safety_factor * 1.06          # a little margin: the final check uses the smoothed blade
-        for _ in range(24):
+        # the strongest state seen: thickening can make a blade weaker (when the stress is mostly
+        # centrifugal, thicker sections add more pull than they add strength), so a worse step is undone
+        best = (st["sf_overall"], ctx, ctx.tc_floor, vp, ev, st)
+        hmax, dmax = self.hub_limits(D)
+        damp = 1.0          # thickening step size (exponent on the factor); halved after a step that hurt
+        blocked = False     # thickening no longer helps at this hub size
+
+        def solve(c, guess):
+            vp2, ev2 = _solve_vp(c, kind, target, guess=guess, rtol=1e-4)
+            if vp2 is None and allow_closest and ev2 is not None and np.isfinite(ev2.get("vp", np.nan)):
+                vp2 = float(ev2["vp"])
+            return vp2, ev2
+        for _ in range(40):
             if st["sf_overall"] >= sf_t:
                 break
-            k = structure.thickness_scale_needed(st, sf_t, k_max=3.0)
-            dd = _eval(ctx, vp, st["r"], detail=True)
-            # thick roots only inside the hub cut-off (not analysed aerodynamically); the polars end at
-            # TC_GRID[-1], so the analysed blade stays within that
-            cap = np.where(st["r"] < ctx.r0, TC_STRUCT_ROOT,
-                           np.where(st["r"] < ctx.rt, TC_GRID[-1], TC_STRUCT_MAX))
-            old = np.interp(st["r"], *ctx.tc_floor) if ctx.tc_floor is not None else np.zeros_like(st["r"])
-            want = np.maximum(np.minimum(dd["tc"] * k, cap), old)
-            if np.any(want > np.maximum(old, dd["tc"]) + 2e-3):
-                ctx.tc_floor = (st["r"].copy(), want)
-            else:
+            prev = (ctx, ctx.tc_floor, vp, ev, st)
+            step = None
+            if not blocked:
+                dd = _eval(ctx, vp, st["r"], detail=True)
+                cap = self.strength_cap(ctx, st["r"])
+                k = structure.thickness_scale_tapered(st, sf_t, k_cap=np.minimum(cap / np.maximum(dd["tc"], 1e-6), 3.0)) ** damp
+                old = np.interp(st["r"], *ctx.tc_floor) if ctx.tc_floor is not None else np.zeros_like(st["r"])
+                want = np.maximum(np.minimum(dd["tc"] * k, cap), old)
+                if np.any(want > np.maximum(old, dd["tc"]) + 2e-3):
+                    ctx.tc_floor = (st["r"].copy(), want)
+                    step = "thick"
+            if step is None:
                 # thickening is used up; at the root a bigger hub gives the blade a bigger root section
-                if st["r_min"] > ctx.rt + 0.05 * ctx.R:
+                # (a taller hub mostly: the root chord is what fits in the hub's height)
+                # (also when the weak spot is further out but thickening it overloads the root)
+                root = np.asarray(st["r"]) < ctx.rt + 0.05 * ctx.R
+                sf_root = min(float(np.min(np.asarray(st["sf"])[root])) if root.any() else 9e9,
+                              (st.get("hub") or {}).get("sf", 9e9))
+                if st["r_min"] > ctx.rt + 0.05 * ctx.R and not (blocked and sf_root < sf_t):
                     break
                 hd, hh = 2 * ctx.rh, ctx.hub_h
-                hmax = 0.12 * D + 2 * sp.hub.margin_mm() / 1e3      # (plus room for fillet / offset / edges)
                 if sp.hub_height_mm is None and hh < hmax - 1e-6:
                     hh = min(hh * 1.25, hmax)
-                elif sp.hub_diameter_mm is None and hd < 0.18 * D - 1e-6:
-                    hd = min(hd * 1.15, 0.18 * D)
+                elif sp.hub_diameter_mm is None and hd < dmax - 1e-6:
+                    hd = min(hd * 1.15, dmax)
                 else:
                     break
-                floor = ctx.tc_floor
+                floor = best[2] if best[1].rh == ctx.rh and best[1].hub_h == ctx.hub_h else ctx.tc_floor
                 ctx = _Ctx(self, D, ctx.rpm, hub_d=hd, hub_h=hh)
                 ctx.tc_floor = floor
-            vp2, ev2 = _solve_vp(ctx, kind, target, guess=vp, rtol=1e-4)
+                step, blocked, damp = "hub", False, 1.0
+            vp2, ev2 = solve(ctx, vp)
             if vp2 is None:
+                if step == "thick":         # this step cannot be flown: undo it, try the hub instead
+                    ctx, floor, vp, ev, st = prev
+                    ctx.tc_floor = floor
+                    blocked = True
+                    continue
                 break
             vp, ev = vp2, ev2
             st = self.struct_eval(ctx, vp, n=25)
+            if st["sf_overall"] > best[0]:
+                best = (st["sf_overall"], ctx, ctx.tc_floor, vp, ev, st)
+            elif step == "thick" and st["sf_overall"] < prev[4]["sf_overall"]:
+                # this thickening made it weaker (mostly the extra mass further out): undo it and try a
+                # smaller step, then the hub
+                ctx, floor, vp, ev, st = prev
+                ctx.tc_floor = floor
+                if damp > 0.3:
+                    damp *= 0.5
+                else:
+                    blocked = True
+        if st["sf_overall"] < best[0]:
+            _, ctx, floor, vp, ev, st = best
+            ctx.tc_floor = floor
         return ctx, vp, ev, st
 
     def objective(self, row):
@@ -1095,6 +1208,29 @@ class _Designer:
                                                       else "motor speed"))
         return best
 
+    def aero_fallback(self, best_sf):
+        """No design reaches the safety factor: the aerodynamic design, its stresses reported."""
+        sp, say = self.spec, self.say
+        # nothing in the scan is strong enough in this material and process: design for aerodynamics and
+        # report the shortfall, instead of showing a blade thickened out of shape that still is not
+        # strong enough
+        from dataclasses import replace as _replace
+        say("No design meets the strength limits; designing for aerodynamics...")
+        alt = _Designer(_replace(sp, respect_strength=False), say)
+        des = alt.run()
+        des.spec = sp
+        des.strength_fallback = True
+        des.strength_best_sf = best_sf
+        # the aerodynamic redesign ran with the sizing off; the user had it on
+        des.notes = [n.replace("'respect strength limits' (thickens the blade, or slows it down)",
+                               "thicker sections (Root / Tip thickness)") for n in des.notes]
+        des.notes.insert(0, f"STRENGTH LIMIT NOT REACHABLE: no diameter / rpm in the scan reaches safety factor "
+                            f"{sp.safety_factor:g} in {self.mat['material']} ({self.mat['process'].lower()}), even "
+                            f"thickened (best {best_sf:.2f}); this is the aerodynamic design, with its own "
+                            f"stresses below. Use a stronger material or process, a lower tip speed or power, "
+                            f"or more blades")
+        return des
+
     def run(self):
         from scipy.optimize import minimize_scalar
         sp = self.spec
@@ -1121,24 +1257,17 @@ class _Designer:
         ib = max(range(len(rows)), key=lambda i: self.score(rows[i]))
         best = rows[ib]
         relax = not best["feasible"]
-        if sp.respect_strength and not any(r["feasible"] for r in rows) and \
-                any(r.get("feasible_aero") and r.get("sf", 9e9) < sp.safety_factor for r in rows):
-            # nothing in the scan is strong enough in this material and process: design for aerodynamics and
-            # report the shortfall, instead of showing a blade thickened out of shape that still is not
-            # strong enough
-            from dataclasses import replace as _replace
-            say("No design meets the strength limits; designing for aerodynamics...")
-            alt = _Designer(_replace(sp, respect_strength=False), say)
-            des = alt.run()
-            des.spec = sp
-            des.strength_fallback = True
-            best_sf = max(r.get("sf", 0.0) for r in rows)
-            des.notes.insert(0, f"STRENGTH LIMIT NOT REACHABLE: no diameter / rpm in the scan reaches safety factor "
-                                f"{sp.safety_factor:g} in {self.mat['material']} ({self.mat['process'].lower()}), even "
-                                f"thickened (best {best_sf:.2f}); this is the aerodynamic design, with its own "
-                                f"stresses below. Use a stronger material or process, a lower tip speed or power, "
-                                f"or more blades")
-            return des
+        short = sp.respect_strength and not any(r["feasible"] for r in rows) and \
+            any(r.get("feasible_aero") and r.get("sf", 9e9) < sp.safety_factor for r in rows)
+        best_sf = max((r.get("sf", 0.0) for r in rows if r.get("feasible_aero")), default=0.0)
+        if short and sp.out_of_reach != "aero":
+            # nothing reaches the safety factor: keep the best-performing size / speed, with the blade as the
+            # strength sizing left it (thickened to the limits, hub grown), flagged. (Chasing the highest
+            # safety factor instead ends on a degenerate, barely loaded prop for a few % more.)
+            best = max((r for r in rows if r.get("feasible_aero")), key=lambda r: r["objective"])
+            relax = False
+        elif short:
+            return self.aero_fallback(best_sf)
         # refine between the neighbours when the optimum is inside the scan
         if 0 < ib < len(rows) - 1 and not sp.diameter_mm and rows[ib + 1]["feasible"] and rows[ib - 1]["feasible"]:
             say("Refining the diameter...")
@@ -1179,10 +1308,69 @@ class _Designer:
         target = tgt(rpm)
         if best.get("torque_short"):          # thrust target out of reach: the most the torque limit allows
             kind, target = "P", sp.max_torque_Nm * rpm * 2 * np.pi / 60
+        if sp.respect_strength and "sf" not in best:
+            # the point shown was never sized (its target is out of reach, so the scan had no blade to
+            # check there): size the closest design, so the strength limits still apply to what is shown
+            say("Sizing the blade for strength...")
+            ctx_s = _Ctx(self, D, rpm)
+            vps, evs = _solve_vp(ctx_s, kind, target)
+            if vps is None:
+                vps = float(evs["vp"])
+            ctx_s, vps, evs, st_s = self.size_for_strength(ctx_s, kind, target, vps, evs, allow_closest=True)
+            best = dict(best, sf=st_s["sf_overall"], tc_floor=ctx_s.tc_floor, hub_h=ctx_s.hub_h, hub_d=2 * ctx_s.rh)
         self.final_floor = best.get("tc_floor")
         self.final_hub_h = best.get("hub_h")
         self.final_hub_d = best.get("hub_d")
-        return self.finalize(D, rpm, kind, target, scan, limited, relax, dict(scan=t_scan, aero=self.t_aero))
+        des = self.finalize(D, rpm, kind, target, scan, limited, relax, dict(scan=t_scan, aero=self.t_aero))
+        if short and sp.out_of_reach != "aero":
+            # the thickened blade is usually the stronger one, but not when the stress is mostly centrifugal
+            # (thicker sections add more pull than strength): then the aerodynamic design is kept
+            alt = self.aero_fallback(best_sf)
+            if alt.structure["sf_overall"] > des.structure["sf_overall"] * 1.02:
+                alt.notes.insert(1, f"thickening does not help this blade (it came out at safety factor "
+                                    f"{des.structure['sf_overall']:.2f}, the stress being mostly centrifugal): "
+                                    "the thinner aerodynamic design is the stronger one")
+                return alt
+            des.strength_strongest = True
+            des.strength_best_sf = best_sf
+            des.notes.insert(0, f"STRENGTH LIMIT NOT REACHABLE: no diameter / rpm in the scan reaches safety factor "
+                                f"{sp.safety_factor:g} in {self.mat['material']} ({self.mat['process'].lower()}); "
+                                f"this is the best-performing size with the blade thickened as far as the limits "
+                                f"allow (hub grown where free), safety factor {des.structure['sf_overall']:.2f}"
+                                + self.strength_advice(des))
+        elif sp.respect_strength and des.structure and des.structure["sf_overall"] < 0.97 * sp.safety_factor:
+            # every candidate missed some other limit (tip Mach, voltage, power the blade can absorb), so the
+            # closest one is shown; it was sized as far as the limits allow and is still short
+            des.strength_strongest = True
+            des.strength_best_sf = des.structure["sf_overall"]
+            des.notes.insert(0, f"STRENGTH LIMIT NOT REACHABLE: safety factor {des.structure['sf_overall']:.2f} "
+                                f"against {sp.safety_factor:g} in {self.mat['material']} "
+                                f"({self.mat['process'].lower()}), with the blade thickened as far as the limits "
+                                f"allow (hub grown where free)" + self.strength_advice(des))
+        return des
+
+    def strength_advice(self, des):
+        """The rest of the 'not reachable' note: where the blade is weakest and what would help."""
+        sp, st = self.spec, des.structure
+        R, rh = des.diameter_mm / 2e3, des.hub_diameter_mm / 2e3
+        at_root = st["r_min"] < rh + 0.2 * (R - rh)
+        hub_weak = bool(st.get("hub")) and st["hub"]["sf"] <= st["sf_min"]
+        where = ("the hub ring around the bore" if hub_weak else
+                 f"the blade {'root' if at_root else 'at r/R ' + format(st['r_min'] / R, '.2f')}")
+        txt = f". Weakest: {where} ({st['governing']}, {100 * st['cf_share']:.0f} % of the stress centrifugal)"
+        fixes = []
+        set_hub = [f"{k} {v:g} mm" for k, v in (("height", sp.hub_height_mm), ("diameter", sp.hub_diameter_mm)) if v]
+        if (at_root or hub_weak) and set_hub:
+            fixes.append(f"leave the hub {' and '.join(k.split()[0] for k in set_hub)} blank (you set "
+                         f"{', '.join(set_hub)}), so the sizing can grow the hub and with it the root")
+        if at_root and sp.hub.fillet_radius() <= 0 and not hub_weak:
+            fixes.append("add a root fillet")
+        if st["cf_share"] > 0.5:
+            fixes.append("lower the tip speed (rpm or diameter: the centrifugal stress goes as the tip speed squared)")
+        else:
+            fixes.append("load each blade less (more blades, or less power)")
+        fixes.append("use a stronger material or process")
+        return txt + ". To fix: " + "; ".join(fixes)
 
     # ------------------------------------------------------------------ final design
     def profile(self, ctx, vp):
@@ -1387,10 +1575,15 @@ class _Designer:
                 fixes.append("'respect strength limits' (thickens the blade, or slows it down)")
             if st.get("hub") and st["hub"]["sf"] < sp.safety_factor:
                 fixes.append("a larger or taller hub")
+            if sp.hub.fillet_radius() <= 0 and st["r_min"] < ctx.rt + 0.05 * ctx.R:
+                fixes.append("a root fillet")
+            if sp.respect_strength and (sp.hub_height_mm or sp.hub_diameter_mm) and st["r_min"] < ctx.rt + 0.05 * ctx.R:
+                fixes.append("leaving Hub height / diameter on auto (the sizing grows the hub)")
             n.insert(0, f"STRENGTH: safety factor {st['sf_overall']:.2f}, below the design value {sp.safety_factor:g} "
                      f"({st['governing'] if st['sf_min'] <= (st['hub'] or {}).get('sf', 9e9) else 'hub ring'}"
-                     f", at r = {st['r_min'] * 1e3:.0f} mm, {100 * st['cf_share']:.0f} % of the stress centrifugal); "
-                     "fix with " + ", ".join(fixes))
+                     f", at r = {st['r_min'] * 1e3:.0f} mm, {100 * st['cf_share']:.0f} % of the stress centrifugal)"
+                     + ("; the blade is already thickened as far as the limits allow" if sp.respect_strength and fl is not None
+                        else "") + "; fix with " + ", ".join(fixes))
         if not m["process_ok"]:
             n.append(f"{m['material']} is not usually made by {m['process'].lower()}: check the strength data")
         if m["material_note"]:
@@ -1556,10 +1749,314 @@ def design(spec: DesignSpec | None = None, progress=None) -> PropDesign:
     """Design the ideal prop for spec. progress: optional callable(str) for status messages."""
     say = progress or (lambda _m: None)
     t = time.time()
-    des = _Designer(spec or DesignSpec(), say).run()
+    spec = spec or DesignSpec()
+    des = _Designer(spec, say).run()
+    if spec.source == "motor" and spec.airspeed > (spec.low_speed or 0.0):
+        des = _low_speed_pass(des, spec, say)
+    if spec.avoid_resonance and des.vibration and not des.vibration.get("ok", True):
+        des = _avoid_resonance(des, spec, say)
     des.timings["total"] = time.time() - t
     say(f"Design done in {des.timings['total']:.1f} s")
     return des
+
+
+def _motor_of(spec):
+    vbatt = spec.voltage or (spec.cells * spec.cell_voltage if spec.cells else None)
+    return motor_mod.Motor(spec.kv, spec.rm, spec.i0, spec.esc_eff).with_estimates(vbatt, spec.motor_power_W), vbatt
+
+
+def low_speed_point(des, V=None, q_max=None, v_ok=False):
+    """The finished design (des.geom / des.polar, PropSim's BEMT) at full throttle at airspeed V (default
+    the spec's stall / takeoff speed, 0 = static): rpm, torque, thrust, current; with q_max, whether that
+    is over the torque limit, the throttle and motor current that hold it at the limit there, and (v_ok)
+    the airspeed above which full throttle stays within it."""
+    sp = des.spec
+    m, U = _motor_of(sp)
+    V = (sp.low_speed or 0.0) if V is None else V
+    kw = dict(rho=sp.rho, polar=des.polar, swirl=True, hub_loss=False)
+
+    def q_at(rpm, v):
+        return bemt.solve(des.geom, rpm, airspeed=v, **kw).torque
+
+    def full(v):
+        rpm = motor_mod.solve_full_throttle(des.geom, m, U, airspeed=v, **kw)
+        return rpm, bemt.solve(des.geom, rpm, airspeed=v, **kw)
+    # a prop made for speed is stalled at low speed, so its torque need not be highest at the lowest speed:
+    # it peaks where the blade is about to stall, often not far below the design speed. Check speeds from V
+    # up to the design speed (closer together near it) and keep the worst
+    Vd = sp.airspeed
+    pts = []
+    for v in ([V + f * (Vd - V) for f in (0.0, 0.25, 0.5, 0.65, 0.75, 0.85, 0.93)] if Vd > V else [V]):
+        try:
+            pts.append((v,) + full(v))
+        except ValueError:
+            continue
+    if not pts:
+        raise ValueError("the motor cannot turn this prop at full throttle at low speed")
+    V_low = V
+    V, rpm, r = max(pts, key=lambda p: p[2].torque)
+    el = m.electrical(rpm, r.torque)
+    out = dict(airspeed=V, low_speed=V_low, speeds_checked=[p[0] for p in pts],
+               torque_by_speed=[p[2].torque for p in pts], rpm=rpm, torque_Nm=r.torque, thrust_N=r.thrust, power_W=r.power,
+               current_A=el["current"], battery_current_A=el["battery_power"] / U,
+               stalled_fraction=r.stalled_fraction, rated_current_A=sp.motor_power_W / U, max_torque_Nm=q_max,
+               over=bool(q_max and r.torque > q_max * 1.005))
+    if out["over"]:
+        from scipy.optimize import brentq
+        # the throttle that holds the torque at the limit at V: the rpm where the prop needs q_max
+        rq = brentq(lambda x: q_at(x, V) - q_max, 50.0, rpm, xtol=1.0)
+        e2 = m.electrical(rq, q_max)
+        out.update(throttle=e2["motor_voltage"] / U, rpm_at_limit=rq, current_limit_A=e2["current"],
+                   thrust_at_limit_N=bemt.solve(des.geom, rq, airspeed=V, **kw).thrust)
+        if v_ok:
+            lo, hi = V, sp.airspeed
+            for _ in range(6):
+                mid = 0.5 * (lo + hi)
+                try:
+                    over = full(mid)[1].torque > q_max
+                except ValueError:
+                    over = True
+                lo, hi = (mid, hi) if over else (lo, mid)
+            out["v_ok"] = hi
+    return out
+
+
+def _nm(x):
+    """A torque for the notes: 3 significant figures below 1 N·m, else 2 decimals."""
+    return f"{x:.3g}" if abs(x) < 1 else f"{x:.2f}"
+
+
+def _low_speed_pass(des, spec, say):
+    """Full throttle at the stall / takeoff speed: report it, and with a torque limit either redesign with
+    less torque at the design speed until full throttle stays within the limit from the low speed up
+    ('respect'), or keep the design and say what throttle / current limit to use ('throttle')."""
+    from dataclasses import replace as _replace
+    q_max = spec.max_torque_Nm
+    V0 = spec.low_speed or 0.0
+    where = f"{V0:g} m/s" if V0 > 0 else "standstill"
+
+    def at(lp_):
+        v = lp_["airspeed"]
+        return "standstill" if v <= 0 else f"{v:.0f} m/s"
+    try:
+        say("Checking full throttle at the stall / takeoff speed...")
+        lp = low_speed_point(des, q_max=q_max, v_ok=spec.low_speed_mode == "throttle")
+    except Exception as exc:  # noqa: BLE001 - the check must never break a design
+        des.notes.append(f"low-speed check failed ({exc})")
+        return des
+    des.low_speed = lp
+    txt = (f"at {at(lp)}, full throttle: {lp['rpm']:,.0f} rpm, {_nm(lp['torque_Nm'])} N·m, {lp['current_A']:.0f} A, "
+           f"thrust {lp['thrust_N']:.1f} N" + (f" ({100 * lp['stalled_fraction']:.0f} % of the blade stalled)"
+                                                if lp["stalled_fraction"] > 0.25 else ""))
+    if not lp["over"]:
+        n = txt + (f", within the {q_max:g} N·m torque limit" if q_max else
+                   f" (rated current {lp['rated_current_A']:.0f} A)")
+        des.notes.append(n)
+        des.minor_notes.append(n)
+        return des
+    if spec.low_speed_mode == "throttle":
+        v_ok = lp.get("v_ok", spec.airspeed)
+        until = (f"from {where} up to the design speed (it runs right at the limit there)"
+                 if v_ok >= 0.97 * spec.airspeed else f"from {where} up to about {v_ok:.0f} m/s")
+        des.notes.insert(0, f"LOW SPEED: {txt}, over the {q_max:g} N·m torque limit (the worst of the speeds "
+                            f"checked from {where} up). Keep the throttle below {100 * lp['throttle']:.0f} % (or "
+                            f"limit the motor current to {lp['current_limit_A']:.0f} A) {until}; at that throttle it "
+                            f"makes {lp['thrust_at_limit_N']:.1f} N at {lp['rpm_at_limit']:,.0f} rpm there")
+        return des
+    # respect: less torque at the design speed; full-throttle torque at the low speed scales about with it
+    q_d, best, last = des.torque_Nm, None, None
+    q_try = q_d * q_max / lp["torque_Nm"] * 0.985
+    for i in range(5):
+        say(f"Redesigning for full throttle at {where} within the torque limit... ({i + 1})")
+        try:
+            d = _Designer(_replace(spec, max_torque_Nm=q_try), lambda _m: None).run()
+            lp2 = low_speed_point(d, q_max=q_max)
+        except Exception:  # noqa: BLE001
+            break
+        last = (d, lp2, q_try)
+        if lp2["torque_Nm"] <= q_max * 1.002:
+            if best is None or d.thrust_N > best[0].thrust_N:
+                best = (d, lp2, q_try)
+            if lp2["torque_Nm"] >= q_max * 0.96:
+                break
+        q_try = q_try * q_max / lp2["torque_Nm"] * (0.985 if lp2["torque_Nm"] > q_max else 0.995)
+    if best is None:
+        des.notes.insert(0, f"LOW SPEED: {txt}, over the {q_max:g} N·m torque limit, and a redesign with less "
+                            "torque did not bring it within the limit; limit the throttle there")
+        return des
+    d, lp2, q_try = best
+    d.spec = spec
+    d.low_speed = lp2
+    d.low_speed_cap = q_try
+    if d.electrical:
+        d.electrical["max_torque"] = q_max      # the motor's real limit (the design ran with a lower cap)
+    goal = "thrust" if spec.goal == "max_thrust" else "goal"
+    cost = 1 - _goal_value(d) / _goal_value(des) if _goal_value(des) > 0 else 0.0
+    d.notes.insert(0, f"LOW SPEED: designed so full throttle stays within the {q_max:g} N·m torque limit from "
+                      f"{where} up: {_nm(d.torque_Nm)} N·m at {spec.airspeed:g} m/s, at most {_nm(lp2['torque_Nm'])} N·m "
+                      f"lower down (at {at(lp2)}: {lp2['rpm']:,.0f} rpm, {lp2['current_A']:.0f} A, thrust {lp2['thrust_N']:.1f} N); "
+                      f"this costs {100 * cost:.1f} % of the {goal} at {spec.airspeed:g} m/s (the design that ignores "
+                      f"it would need {_nm(lp['torque_Nm'])} N·m at {at(lp)}; 'At low speed: Throttle' keeps that one)")
+    d.timings.update({k: v for k, v in des.timings.items() if k not in d.timings})
+    return d
+
+
+def resonance_margin(vb) -> float:
+    """Smallest distance (fraction) of any blade mode from the excitation order nearest to it, over the
+    orders checked (1P-4P); >= structure.RES_MARGIN means no resonance at the design speed."""
+    if not vb:
+        return 1.0
+    ms = [m["margin"] for m in vb["modes"] if m["nearest_order"] in vb.get("orders", structure.RES_ORDERS)]
+    return float(min(ms)) if ms else 1.0
+
+
+def _goal_value(des) -> float:
+    """The design's goal as one higher-is-better number (thrust, efficiency, or minus the power)."""
+    sp = des.spec
+    if sp.goal == "target_thrust":
+        return -((des.electrical or {}).get("battery_power") or des.shaft_power_W)
+    if sp.goal == "efficiency":
+        return des.efficiency if sp.airspeed > 0 else des.figure_of_merit
+    return des.thrust_N
+
+
+RES_COST_MAX = 0.03     # the most of the goal (thrust, efficiency, power) the resonance avoidance may give up
+
+
+def _avoid_resonance(des, spec, say):
+    """A blade mode is resonant at the design speed: redesign with a stiffer (or softer) blade root, using
+    only what the user left on auto (hub-end thickness, hub diameter, root thickness), and keep the variant
+    that clears every 1P-4P margin for the least loss of the goal (at most RES_COST_MAX), never weaker than
+    the safety factor asked for (or than the plain design). The root is where the low modes bend most, and
+    hub-end thickness and hub diameter cost almost no thrust (they sit in the hub cut-off)."""
+    from dataclasses import replace as _replace
+    m0, g0 = resonance_margin(des.vibration), _goal_value(des)
+    sf0 = des.structure["sf_overall"] if des.structure else 0.0
+    sf_need = min(spec.safety_factor, sf0) * 0.99 if spec.respect_strength else 0.0
+    # the variants keep the design's diameter (a stiffer root hardly moves the optimum, and one diameter is
+    # several times faster than the scan); the rpm is still optimised where it is free
+    d_all = des.diameter_mm * (1 + spec.features.winglet_extension())
+    base = _replace(spec, avoid_resonance=False, diameter_mm=d_all, max_diameter_mm=max(spec.max_diameter_mm, d_all),
+                    max_torque_Nm=getattr(des, "low_speed_cap", None) or spec.max_torque_Nm)
+    hub_d0 = des.hub_diameter_mm
+    d_max = 0.20 * des.diameter_mm
+    fam_root = AIRFOILS[spec.airfoil]["tc_root"] if "tc_root" in AIRFOILS[spec.airfoil] else None
+
+    def variants(stage):
+        end = [dict()] if spec.tc_hub is not None else [dict(tc_hub=TC_STRUCT_ROOT)]
+        if stage == 0:
+            out = list(end) if spec.tc_hub is None else []
+            if spec.hub_diameter_mm is None:
+                for f in (1.06, 1.12, 1.18, 1.25):
+                    if hub_d0 * f <= d_max + 1e-6:
+                        out.append(dict(end[-1], hub_diameter_mm=float(round(hub_d0 * f, 1))))
+            return out
+        out = []
+        if spec.tc_root is None and fam_root:
+            for dt in (-0.03, 0.03, 0.06):
+                t = fam_root + dt
+                if TC_GRID[0] <= t <= 0.33:
+                    out.append(dict(end[-1], tc_root=round(t, 3)))
+        return out
+    # screen every variant with the design method alone (fast), then run the most promising ones in full
+    D_r, rpm0 = des.diameter_mm / 1e3, des.rpm
+    say("Checking ways to move a resonant blade mode...")
+    # the screen runs the plain blade too: its frequencies differ from the full design's by a few % (no BEMT
+    # check), and the same correction, mode by mode, is applied to every variant
+    try:
+        g_ref, _, vb_ref = _Designer(base, lambda _m: None).quick_check(D_r, rpm0)
+        corr = {m["name"]: m0_["per_rev"] / m["per_rev"] for m in vb_ref["modes"]
+                for m0_ in des.vibration["modes"] if m0_["name"] == m["name"] and m["per_rev"] > 0}
+    except Exception:  # noqa: BLE001
+        g_ref, corr = None, {}
+    orders = des.vibration.get("orders", structure.RES_ORDERS)
+
+    def margin_est(vb):
+        ms = []
+        for m in vb["modes"]:
+            pr = m["per_rev"] * corr.get(m["name"], 1.0)
+            k = int(round(pr))
+            if k in orders:
+                ms.append(abs(pr / k - 1))
+        return min(ms) if ms else 1.0
+    screened = []
+    for stage in (0, 1):
+        for kw in variants(stage):
+            try:
+                g, sf, vb = _Designer(_replace(base, **kw), lambda _m: None).quick_check(D_r, rpm0)
+            except Exception:  # noqa: BLE001 - a variant that fails is simply not used
+                continue
+            cost = (1 - g / g_ref if g_ref and g_ref > 0 else (g_ref - g) / max(abs(g_ref or 1), 1e-9)) if g_ref else 0
+            screened.append(dict(kw=kw, margin=margin_est(vb), cost=cost, sf=sf, stage=stage))
+        if any(t["margin"] >= structure.RES_MARGIN + 0.01 and t["cost"] <= RES_COST_MAX and t["sf"] >= sf_need
+               for t in screened):
+            break
+    def rank(t):
+        usable = t["cost"] <= RES_COST_MAX and t["sf"] >= sf_need
+        # usable and comfortably clear (3 % beyond the margin, the screen being approximate) first, then
+        # usable and clear, then the rest; within each, the least goal lost, with some credit for margin
+        return (not (usable and t["margin"] >= structure.RES_MARGIN + 0.03),
+                not (usable and t["margin"] >= structure.RES_MARGIN + 0.01), t["cost"] - 0.1 * min(t["margin"], 0.15))
+    cand = sorted(screened, key=rank)
+    tried = []
+    for t in cand[:3]:
+        say("Moving a resonant blade mode...")
+        try:
+            d = _Designer(_replace(base, **t["kw"]), lambda _m: None).run()
+        except Exception:  # noqa: BLE001
+            continue
+        sf = d.structure["sf_overall"] if d.structure else 0.0
+        cost = 1 - _goal_value(d) / g0 if g0 > 0 else (g0 - _goal_value(d)) / max(abs(g0), 1e-9)
+        tried.append(dict(kw=t["kw"], des=d, margin=resonance_margin(d.vibration), cost=cost,
+                          ok=sf >= sf_need and cost <= RES_COST_MAX))
+        if tried[-1]["ok"] and tried[-1]["margin"] >= structure.RES_MARGIN:
+            break
+    clear = [t for t in tried if t["ok"] and t["margin"] >= structure.RES_MARGIN]
+    pick = None
+    if clear:
+        # least goal lost, with a little credit for a mode further from its order (up to 15 %)
+        pick = max(clear, key=lambda t: -t["cost"] + 0.1 * min(t["margin"], 0.15))
+    else:
+        better = [t for t in tried if t["ok"] and t["margin"] > m0 + 0.03]
+        if better:
+            pick = max(better, key=lambda t: t["margin"] - t["cost"])
+    if pick is None:
+        des.notes.append("resonance: no hub-end thickness, hub diameter or root thickness within "
+                         f"{100 * RES_COST_MAX:.0f} % of the {('thrust' if spec.goal == 'max_thrust' else 'goal')} "
+                         "moves the mode out of the 10 % band; change the rpm, the material or the blade by hand")
+        return des
+    d = pick["des"]
+    d.spec = spec
+    d.limited_by, d.scan = des.limited_by, des.scan      # what chose the size: the plain design's scan
+    # the low-speed result (and its notes) carry over: a stiffer root hardly changes it
+    for k in ("low_speed", "low_speed_cap"):
+        if hasattr(des, k):
+            setattr(d, k, getattr(des, k))
+    ls_notes = [n for n in des.notes if n.startswith("LOW SPEED") or (n.startswith("at ") and "full throttle" in n)]
+    d.notes = [n for n in ls_notes if n.startswith("LOW SPEED")] + d.notes + \
+        [n for n in ls_notes if not n.startswith("LOW SPEED")]
+    d.minor_notes += [n for n in ls_notes if n in des.minor_notes]
+    if getattr(d, "low_speed_cap", None) and d.electrical:
+        d.electrical["max_torque"] = spec.max_torque_Nm
+    vb0 = des.vibration
+    worst = min((m for m in vb0["modes"] if m["nearest_order"] in vb0["orders"]), key=lambda m: m["margin"])
+    after = next((m for m in d.vibration["modes"] if m["name"] == worst["name"]), None)
+    names = dict(tc_hub=("hub-end thickness", lambda v: f"{100 * v:.0f} %"),
+                 hub_diameter_mm=("hub diameter", lambda v: f"{v:g} mm (auto {hub_d0:.1f})"),
+                 tc_root=("root thickness", lambda v: f"{100 * v:.0f} %"))
+    what = ", ".join(f"{names[k][0]} {names[k][1](v)}" for k, v in pick["kw"].items())
+    moved = (f"the {worst['name']} mode moved from {worst['per_rev']:.2f}P ({100 * worst['margin']:.0f} % from "
+             f"{worst['nearest_order']}P) to {after['per_rev']:.2f}P" if after else "the modes moved")
+    sf_txt = (f", safety factor {sf0:.2f} -> {d.structure['sf_overall']:.2f}" if d.structure else "")
+    head = ("RESONANCE AVOIDED" if pick["margin"] >= structure.RES_MARGIN else "RESONANCE REDUCED")
+    at = next((i for i, n in enumerate(d.notes) if not n.startswith(("HUB", "STRENGTH LIMIT"))), len(d.notes))
+    d.notes.insert(at, f"{head}: {what}; {moved}; {('thrust' if spec.goal == 'max_thrust' else 'goal')} "
+                      f"{-100 * pick['cost']:+.1f} %{sf_txt}. Set the field(s) by hand, or turn off "
+                      f"'Avoid resonance', to keep your own")
+    d.resonance_fix = dict(changes=pick["kw"], margin_before=m0, margin_after=pick["margin"], cost=pick["cost"],
+                           variants=len(screened), full_runs=len(tried))
+    d.timings.update({k: v for k, v in des.timings.items() if k not in d.timings})
+    return d
 
 
 def _compare_one(spec: DesignSpec) -> dict:
@@ -1982,18 +2479,14 @@ def _hub_opts(design):
 
 
 def _fillet_offset(design, r):
-    """Outward offset of the section outline [m] that makes the blade-root fillet: a quarter circle of
-    the fillet radius f between the hub surface (offset f) and r = r_hub + f (offset 0)."""
-    f = _hub_opts(design).fillet_mm / 1e3
+    """Outward offset of the section outline [m] that makes the blade-root fillet at radius r: from the
+    fillet size at the hub surface down to 0 where it ends (hubgeom.HubOptions.fillet_offset: a quarter
+    circle / ellipse, or a straight chamfer)."""
+    o = _hub_opts(design)
+    if o.fillet_mm <= 0:
+        return 0.0
     rh = design.profile["rh"]
-    if f <= 0:
-        return 0.0
-    x = rh + f - r
-    if x >= f:
-        return f
-    if x <= 0:
-        return 0.0
-    return f - np.sqrt(max(f * f - x * x, 0.0))
+    return float(o.fillet_offset((r - rh) * 1e3)) / 1e3
 
 
 def _offset_loop(s, z, d):
@@ -2074,12 +2567,18 @@ def _span_radii(design, n_span, r_from=None, details=True, per_wave=10, tub=True
     r0 = rh if r_from is None else r_from
     u = np.linspace(0, 1, n_span)
     rr = r0 + (R - r0) * (0.5 * (1 - np.cos(np.pi * u)) * 0.6 + 0.4 * u)
-    f = _hub_opts(design).fillet_mm / 1e3
+    ho = _hub_opts(design)
+    f = ho.fillet_mm / 1e3
     if f > 0:          # sections through the root fillet
         # (no section exactly on the hub surface: a blade edge lying in the hub cylinder is a degenerate
         # case for the STEP's boolean fuse)
-        t0 = np.arccos(1 - min(max(0.25e-3 / f, 0.05), 0.5))       # first one >= 0.25 mm off the hub
-        ex = rh + f * (1 - np.cos(np.linspace(t0, np.pi / 2, 6)))
+        L = ho.fillet_length() / 1e3
+        if ho.fillet_shape == "chamfer":
+            x0 = min(max(0.25e-3, 0.05 * L), 0.3 * L)
+            ex = rh + np.linspace(x0, L, 4)
+        else:
+            t0 = np.arccos(1 - min(max(0.25e-3 / L, 0.05), 0.5))       # first one >= 0.25 mm off the hub
+            ex = rh + L * (1 - np.cos(np.linspace(t0, np.pi / 2, 6)))
         ex = ex[(ex > r0) & (ex < R - 1e-6)]
         gap = 0.4 * np.min(np.diff(ex)) if len(ex) > 1 else 0.1 * f
         far = np.array([np.min(np.abs(ex - x)) > gap if len(ex) else True for x in rr])
@@ -3233,6 +3732,25 @@ def summary_text(design: PropDesign) -> str:
     if d.vibration:
         L.append("")
         L += structure.vibration_lines(d.vibration)
+    ls = getattr(d, "low_speed", None)
+    if ls:
+        q_max = ls.get("max_torque_Nm")
+        v0 = ls.get("low_speed", 0.0)
+        L.append("")
+        L.append(f"Full throttle below the design speed (from {'standstill' if v0 <= 0 else f'{v0:g} m/s'}"
+                 + (f"; torque limit {q_max:g} N·m)" if q_max else ")"))
+        L.append("  airspeed [m/s]   torque [N·m]")
+        for v, q in zip(ls["speeds_checked"], ls["torque_by_speed"]):
+            L.append(f"  {v:14.0f}   {q:12.2f}" + ("   over the limit" if q_max and q > q_max * 1.005 else ""))
+        L.append(f"  worst: {ls['torque_Nm']:.2f} N·m at {ls['airspeed']:.0f} m/s, {ls['rpm']:,.0f} rpm, "
+                 f"{ls['current_A']:.0f} A motor current, {ls['thrust_N']:.1f} N thrust")
+        if ls.get("throttle"):
+            L.append(f"  to stay within the limit there: throttle {100 * ls['throttle']:.0f} % or a motor current "
+                     f"limit of {ls['current_limit_A']:.0f} A")
+        if getattr(d, "low_speed_cap", None):
+            L.append(f"  designed for {d.low_speed_cap:.2f} N·m at the design speed so full throttle stays within "
+                     "the limit at every speed checked")
+        L.append("  (the speed prop is partly stalled at low speed: PropSim's post-stall model makes these rough)")
     L.append("")
     L.append("  r/R   r[mm]  chord[mm]  beta[deg]  pitch[mm]   t/c   thick[mm]   Cl   alpha    Re")
     for row in station_rows(d):
@@ -3269,6 +3787,8 @@ def strength_lines(design: PropDesign, table: bool = True) -> list:
     sp = design.spec
     L = structure.summary_lines(st)
     L[0] += "; " + ("the limits were not reachable: aerodynamic design" if getattr(design, "strength_fallback", False)
+                    else "the limits were not reachable: thickened as far as allowed"
+                    if getattr(design, "strength_strongest", False)
                     else "designed within the limits" if sp.respect_strength else "report only, not designed for it")
     L.insert(-1, f"  blade mass {st['mass_blade'] * 1e3:.1f} g each; prop {st['mass_blade'] * 1e3 * design.blades:.1f} g "
                  "of blades plus the hub")
@@ -3360,6 +3880,12 @@ def design_to_dict(design: PropDesign) -> dict:
                     resonant=bool(m["resonant"])) for m in vb["modes"]],
         crossings=vb["crossings"])
     out["minor_notes"] = list(getattr(design, "minor_notes", []))
+    ls = getattr(design, "low_speed", None)
+    if ls:
+        out["low_speed"] = {k: (float(v) if isinstance(v, (float, np.floating)) else v) for k, v in ls.items()}
+    rf = getattr(design, "resonance_fix", None)
+    if rf:
+        out["resonance_fix"] = {k: (float(v) if isinstance(v, (float, np.floating)) else v) for k, v in rf.items()}
     return out
 
 
@@ -3386,6 +3912,12 @@ def parse_args(argv=None):
     g.add_argument("--target-thrust", type=float, help="thrust to reach with the least power [N]")
     g.add_argument("--airspeed", type=float, default=0.0, help="design airspeed [m/s] (0 = static)")
     g.add_argument("--rho", type=float, default=1.225)
+    g.add_argument("--low-speed", type=float,
+                   help="stall / takeoff speed [m/s]: with a motor, full throttle is also checked there against "
+                        "--max-torque (default: standstill, 0 m/s)")
+    g.add_argument("--low-speed-mode", choices=["respect", "throttle"], default="respect",
+                   help="torque over the limit at the low speed: redesign with less torque at the design speed "
+                        "(respect, default) or keep the design and report the throttle / current limit to use")
     c = ap.add_argument_group("constraints (lengths in --units)")
     c.add_argument("--blades", type=int, default=2, help="number of blades (1 = single blade with a counterweight)")
     c.add_argument("--counterweight", default="solid", choices=["solid", "printed", "none", *INSERTS],
@@ -3410,6 +3942,12 @@ def parse_args(argv=None):
     s_.add_argument("--alt-load", type=float, default=0.3,
                     help="alternating load for the fatigue check, as a fraction of the aerodynamic bending "
                          "(default 0.3; more for edgewise flight, gusty or vibrating installations)")
+    s_.add_argument("--out-of-reach", choices=["strongest", "aero"], default="strongest",
+                    help="when no size / speed reaches the safety factor: keep the strongest design found "
+                         "(default) or show the aerodynamic design")
+    s_.add_argument("--keep-resonance", action="store_true",
+                    help="do not move a blade mode that is resonant at the design speed (by default the root is "
+                         "stiffened where hub-end thickness, hub diameter and root thickness are on auto)")
     s_.add_argument("--strength-report-only", action="store_true",
                     help="design for aerodynamics only and just report the stresses (default: design within "
                          "the strength limits)")
@@ -3431,6 +3969,9 @@ def parse_args(argv=None):
                    help="design with every airfoil, print the ranking, then output the best one")
     c.add_argument("--tc-tip", type=float)
     c.add_argument("--tc-root", type=float)
+    c.add_argument("--tc-hub", type=float,
+                   help="t/c where the blade meets the hub (default 0.24, up to 0.55; in the hub cut-off: no "
+                        "thrust cost)")
     c.add_argument("--spin", default="ccw", choices=["ccw", "cw"],
                    help="rotation seen from the thrust side (+Z), default ccw")
     c.add_argument("--pitch", type=float, help="set the pitch (in --units; default: the optimum)")
@@ -3472,17 +4013,18 @@ def spec_from_args(a) -> DesignSpec:
         source="motor" if motor else "shaft", kv=a.kv or 0.0, motor_power_W=a.motor_power or 0.0,
         cells=a.cells, cell_voltage=a.cell_voltage, voltage=a.voltage, rm=a.rm, i0=a.i0, esc_eff=a.esc_eff,
         max_torque_Nm=a.max_torque, rpm=a.rpm, shaft_power_W=a.shaft_power, goal=goal, target_thrust_N=a.target_thrust,
-        airspeed=a.airspeed, rho=a.rho, blades=a.blades,
+        airspeed=a.airspeed, rho=a.rho, blades=a.blades, low_speed=a.low_speed, low_speed_mode=a.low_speed_mode,
         counterweight=a.counterweight, material_density=a.material_density,
         max_diameter_mm=L(a.max_diameter) or (L(a.diameter) or 254.0), diameter_mm=L(a.diameter),
         max_tip_mach=a.max_tip_mach, hub_diameter_mm=L(a.hub_diameter), hub_height_mm=L(a.hub_height),
         bore_mm=L(a.bore) or 5.0, min_chord_mm=L(a.min_chord),
         min_thickness_mm=L(a.min_thickness) if a.min_thickness is not None else 0.6,
-        max_chord_ratio=a.max_chord_ratio, airfoil=a.airfoil, tc_tip=a.tc_tip, tc_root=a.tc_root, spin=a.spin,
+        max_chord_ratio=a.max_chord_ratio, airfoil=a.airfoil, tc_tip=a.tc_tip, tc_root=a.tc_root, tc_hub=a.tc_hub, spin=a.spin,
         aero=a.aero, nf_model=a.nf_model, ncrit=a.ncrit, pitch_mm=L(a.pitch), pitch_mode=a.pitch_mode,
         features=a.features, hub=a.hub, material=a.material, process=a.process, strength_mpa=a.strength,
         modulus_gpa=a.modulus, safety_factor=a.safety_factor, fatigue=not a.no_fatigue, alt_load=a.alt_load,
-        respect_strength=not a.strength_report_only)
+        respect_strength=not a.strength_report_only, out_of_reach=a.out_of_reach,
+        avoid_resonance=not a.keep_resonance)
 
 
 def main(argv=None):
