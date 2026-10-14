@@ -42,15 +42,23 @@ It works as a Windows desktop app and as Python command-line tools. You can pick
 
 ![Prop Generator](screenshots/prop-generator.png)
 
-*Prop Generator: a 10 in titanium (SLM) prop for 150 m/s on a 14S motor. The swept blade has leading-edge tubercles; the hub has an ogive spinner, counterbored mounting holes and a blind bore. The generator moved a resonant blade mode itself, and it warns that full throttle at lower airspeeds would exceed the motor's torque limit.*
+*Prop Generator: a 10 in titanium (SLM) prop for 150 m/s on a 14S motor. The swept blade has leading-edge tubercles; the hub has an ogive spinner, counterbored mounting holes, a blind bore and a root fillet. The generator moved a resonant blade mode itself (cyan note), and it warns that full throttle at lower airspeeds would exceed the motor's torque limit, with the throttle to use (amber note).*
+
+![Design brief settings](screenshots/generator-settings.png)
+
+*The design brief, top to bottom: goal, power source and flight condition with the new* Stall speed *and* At low speed*; hub options (spinner, blind bore, D-flat, set screw, nut pocket, mounting holes on a rotatable bolt circle, screw heads, root fillet shape and length); material and strength (supplier, process, material, safety factor, vibration load,* Design within strength limits*,* Avoid resonance*,* If out of reach*); experimental blade features.*
 
 ![Structure tab](screenshots/structure.png)
 
-*Structure tab: the blade coloured by safety factor with the weakest spot marked, the stresses along the blade, the deflection and twist under load, and a plain-language diagnosis.*
+*The new Structure tab: the blade coloured by safety factor with the weakest spot marked, the stresses along the blade, the deflection and twist under load, and a plain-language diagnosis of what limits the blade and how to fix it.*
 
 ![Vibration modes and Campbell diagram](screenshots/structure-vibration.png)
 
-*Each vibration mode can be animated; the Campbell diagram shows the modes against the 1P–4P excitation lines over the rpm range.*
+*Structure tab, Vibration modes: each flap, lag and torsion mode can be animated; the Campbell diagram shows the modes against the 1P–4P excitation lines over the rpm range.*
+
+![3D CFD tab](screenshots/cfd-tab.png)
+
+*3D CFD with the built-in OpenFOAM: a compressible (rhoSimpleFoam) run of a 10x17.2 in prop at 150 m/s (tip Mach 0.92), compared with the BEMT, with the convergence history.*
 
 ## Getting started
 
