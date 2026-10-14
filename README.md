@@ -17,7 +17,7 @@ It works as a Windows desktop app and as Python command-line tools. You can pick
 > [!WARNING]
 > **These are estimates, not measurements.** Read the [disclaimers](#disclaimers) before you build or spin anything this software produces.
 
-![PropSim dashboard](screenshots/dashboard.png)
+![PropSim dashboard: the built-in 10x4.5 in test prop analysed with NeuralFoil sections](screenshots/dashboard.png)
 
 ## Features
 
@@ -38,7 +38,19 @@ It works as a Windows desktop app and as Python command-line tools. You can pick
   - **Experimental blade features:** swept (scimitar) blades, serrated trailing edges, leading-edge tubercles, winglets and raked tips, built into the model, with their effect estimated (and labelled as rough).
   - Tip Mach up to 1.3 and airspeed up to 300 m/s, with transonic and supersonic wave-drag estimates.
 
-![Prop Generator with a single-blade design](screenshots/single-blade.png)
+## Screenshots
+
+![Prop Generator](screenshots/prop-generator.png)
+
+*Prop Generator: a 10 in titanium (SLM) prop for 150 m/s on a 14S motor. The swept blade has leading-edge tubercles; the hub has an ogive spinner, counterbored mounting holes and a blind bore. The generator moved a resonant blade mode itself, and it warns that full throttle at lower airspeeds would exceed the motor's torque limit.*
+
+![Structure tab](screenshots/structure.png)
+
+*Structure tab: the blade coloured by safety factor with the weakest spot marked, the stresses along the blade, the deflection and twist under load, and a plain-language diagnosis.*
+
+![Vibration modes and Campbell diagram](screenshots/structure-vibration.png)
+
+*Each vibration mode can be animated; the Campbell diagram shows the modes against the 1P–4P excitation lines over the rpm range.*
 
 ## Getting started
 
